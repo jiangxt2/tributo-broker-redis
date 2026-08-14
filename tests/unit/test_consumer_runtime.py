@@ -190,6 +190,75 @@ def test_runtime_passes_business_job_id_to_submission() -> None:
     assert worker_config["password_env"] == "WORKER_REDIS_PASSWORD"
 
 
+def test_runtime_maps_canonical_v2_request_without_training_config() -> None:
+    runtime = RedisBrokerRuntime.__new__(RedisBrokerRuntime)
+    runtime.config = RedisBrokerConfig()
+    runtime._redis = MagicMock()
+    runtime._consumer = MagicMock()
+    object.__setattr__(runtime, "_is_cancelled", lambda _job_id: False)
+    with patch(
+        "tributo_broker_redis.runtime.submit_training_job_with_identity",
+        return_value=MagicMock(
+            run_id="canonical-job",
+            attempt_id="attempt-1",
+            job_id="ray-job-1",
+            submission_id="submission-1",
+        ),
+    ) as submit:
+        result = runtime.handle(
+            Message(
+                "canonical-job",
+                {
+                    "raw": json.dumps(
+                        {
+                            "protocol_version": "2.0",
+                            "job_id": "payload-job",
+                            "algorithm": {
+                                "algorithm_key": "xgboost",
+                                "hyper_params": {
+                                    "learning_rate": 0.2,
+                                    "n_estimators": 3,
+                                    "num_workers": 1,
+                                },
+                            },
+                            "datasource": {
+                                "type": "LOCAL",
+                                "properties": {
+                                    "path": "/provider-data/train.csv",
+                                    "format": "csv",
+                                },
+                            },
+                            "features": [{"feature_id": "f1", "result_column": "x1"}],
+                            "target": {
+                                "result_column": "label",
+                                "task_type": "BINARY_CLASSIFICATION",
+                            },
+                            "data_split": {
+                                "train_ratio": 0.5,
+                                "validation_ratio": 0.5,
+                                "test_ratio": 0.0,
+                            },
+                            "storage_context": {
+                                "type": "local",
+                                "prefix": "/tmp/ray_results/bundles/",
+                            },
+                        }
+                    )
+                },
+            )
+        )
+
+    assert result.disposition == TaskDisposition.ACK
+    config = json.loads(
+        submit.call_args.kwargs["env_vars"]["TRIBUTO_TRAINING_CONFIG_JSON"]
+    )
+    assert config["data"]["path"] == "/provider-data/train.csv"
+    assert config["model"]["eta"] == 0.2
+    assert config["training"]["num_rounds"] == 3
+    assert config["ray"]["storage_path"] == "/tmp/ray_results/bundles/_ray"
+    assert config["output"]["bundle_uri"] == "/tmp/ray_results/bundles"
+
+
 def test_redelivery_reuses_same_ray_execution_attempt() -> None:
     config = RedisBrokerConfig()
     runtime = RedisBrokerRuntime.__new__(RedisBrokerRuntime)

@@ -8,6 +8,7 @@ import socket
 import time
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -110,6 +111,59 @@ def _task_payload(
                 "ray": {"num_workers": 1, "storage_path": "/tmp/ray_results"},
                 "output": {"onnx_path": "/tmp/tributo-broker-it.onnx"},
             },
+        },
+        separators=(",", ":"),
+    )
+
+
+def _canonical_task_payload(job_id: str) -> str:
+    """Build a canonical KnoVa v2 request without ``training_config``."""
+    fixture_path = os.environ.get(
+        "BROKER_TRAIN_FIXTURE",
+        "/provider-data/broker_train.csv",
+    )
+    return json.dumps(
+        {
+            "protocol_version": "2.0",
+            "job_id": job_id,
+            "model_id": "it-model",
+            "version_id": "v1",
+            "tenant_id": "it-tenant",
+            "algorithm": {
+                "category": "CLASSIFICATION",
+                "algorithm_key": "xgboost",
+                "hyper_params": {
+                    "max_depth": 2,
+                    "learning_rate": 0.2,
+                    "n_estimators": 2,
+                    "num_workers": 1,
+                },
+            },
+            "datasource": {
+                "type": "LOCAL",
+                "properties": {"path": fixture_path, "format": "csv"},
+            },
+            "features": [
+                {"feature_id": "feature-x1", "result_column": "x1"},
+                {"feature_id": "feature-x2", "result_column": "x2"},
+            ],
+            "target": {
+                "result_column": "label",
+                "task_type": "BINARY_CLASSIFICATION",
+                "label_mapping": {"negative": 0, "positive": 1},
+            },
+            "data_split": {
+                "train_ratio": 0.5,
+                "validation_ratio": 0.5,
+                "test_ratio": 0.0,
+                "random_seed": 42,
+            },
+            "resource_limits": {"early_stopping_patience": 2},
+            "storage_context": {
+                "type": "local",
+                "prefix": f"/tmp/ray_results/canonical/{job_id}/",
+            },
+            "extensions": {},
         },
         separators=(",", ":"),
     )
@@ -390,6 +444,90 @@ def test_real_redis_submission_ack_and_terminal_event(
     assert {"PHASE", "LOG", "METRICS"}.issubset(event_types)
     assert "COMPLETED" in event_types, json.dumps(events, ensure_ascii=False)
     runner.close()
+
+
+def test_real_canonical_v2_training_completes_with_bundle_and_identity(
+    redis_client: redis.Redis,
+    provider_config: RedisBrokerConfig,
+) -> None:
+    """Canonical KnoVa v2 reaches a validated Bundle without private config."""
+    import numpy as np
+    import onnxruntime as ort
+
+    job_id = f"it-canonical-{uuid.uuid4().hex}"
+    redis_client.xadd(
+        provider_config.task_stream_key,
+        {"job_id": job_id, "payload": _canonical_task_payload(job_id)},
+    )
+    runner = _run_one(RedisBrokerPlugin(), provider_config)
+    try:
+        assert (
+            redis_client.xpending(
+                provider_config.task_stream_key,
+                provider_config.consumer_group,
+            )["pending"]
+            == 0
+        )
+        event_stream = provider_config.event_stream_key(job_id)
+        deadline = time.monotonic() + 240
+        events: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            events = _events(redis_client, event_stream)
+            event_types = {event["event_type"] for event in events}
+            if "COMPLETED" in event_types or "FAILED" in event_types:
+                break
+            time.sleep(2)
+
+        event_types = {event["event_type"] for event in events}
+        assert {"PHASE", "LOG", "METRICS", "COMPLETED"}.issubset(event_types), (
+            json.dumps(events, ensure_ascii=False)
+        )
+        assert "FAILED" not in event_types
+        completed = next(
+            event for event in reversed(events) if event["event_type"] == "COMPLETED"
+        )
+        assert completed["execution_id"]
+        assert completed["submission_id"]
+        assert completed["bundle_id"]
+        assert completed["manifest_uri"]
+
+        container_storage = Path("/tmp/ray_results")
+        manifest_uri = Path(completed["manifest_uri"])
+        host_storage = Path(os.environ["BROKER_RAY_STORAGE_DIR"])
+        host_manifest = host_storage / manifest_uri.relative_to(container_storage)
+        manifest = json.loads(host_manifest.read_text())
+        artifacts = {artifact["format"]: artifact for artifact in manifest["artifacts"]}
+        assert {"onnx", "ubj"}.issubset(artifacts)
+
+        onnx_artifact = artifacts["onnx"]
+        onnx_path = (
+            host_manifest.parent
+            / "artifacts"
+            / onnx_artifact["name"]
+            / onnx_artifact["entrypoint"]
+        )
+        ubj_artifact = artifacts["ubj"]
+        ubj_path = (
+            host_manifest.parent
+            / "artifacts"
+            / ubj_artifact["name"]
+            / ubj_artifact["entrypoint"]
+        )
+        assert onnx_path.is_file()
+        assert ubj_path.is_file()
+
+        session = ort.InferenceSession(
+            str(onnx_path),
+            providers=["CPUExecutionProvider"],
+        )
+        outputs = session.run(
+            None,
+            {session.get_inputs()[0].name: np.array([[0.1, 0.2]], dtype=np.float32)},
+        )
+        assert len(outputs) == 2
+        assert len(outputs[0]) == 1
+    finally:
+        runner.close()
 
 
 def test_real_duplicate_delivery_reconciles_same_ray_submission(

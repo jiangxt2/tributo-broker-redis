@@ -26,11 +26,97 @@ def test_protocol_version_and_training_scope() -> None:
     assert is_training_task({"task_type": "INFERENCE"}) is False
 
 
-def test_training_request_requires_config() -> None:
+def test_training_request_preserves_explicit_config() -> None:
     request = TrainingJobRequest(job_id="job-1", training_config={"data": {}})
-    assert request.require_training_config() == {"data": {}}
+    assert request.resolve_training_config() == {"data": {}}
     with pytest.raises(ValueError, match="non-empty"):
-        TrainingJobRequest(job_id="job-1").require_training_config()
+        TrainingJobRequest(job_id="job-1", training_config={}).resolve_training_config()
+
+
+def test_canonical_clickhouse_request_maps_to_xgboost_bundle_config() -> None:
+    request = TrainingJobRequest.model_validate(
+        {
+            "protocol_version": "2.0",
+            "job_id": "train-job-1",
+            "algorithm": {
+                "algorithm_key": "xgboost",
+                "hyper_params": {
+                    "max_depth": 6,
+                    "learning_rate": 0.08,
+                    "n_estimators": 100,
+                    "num_workers": 1,
+                },
+            },
+            "datasource": {
+                "type": "CLICKHOUSE",
+                "host": "analytics.internal",
+                "port": 9000,
+                "database_name": "analytics",
+                "username": "reader",
+                "password": "***",
+            },
+            "data_query": {
+                "query": {
+                    "sql": "SELECT x1, x2, label FROM samples WHERE ts > {p0:String}",
+                    "params": {"p0": "2026-01-01"},
+                }
+            },
+            "features": [
+                {"feature_id": "f1", "result_column": "x1"},
+                {"feature_id": "f2", "result_column": "x2"},
+            ],
+            "target": {
+                "result_column": "label",
+                "task_type": "BINARY_CLASSIFICATION",
+            },
+            "data_split": {
+                "train_ratio": 0.7,
+                "validation_ratio": 0.1,
+                "test_ratio": 0.2,
+                "random_seed": 7,
+            },
+            "resource_limits": {"early_stopping_patience": 9},
+            "storage_context": {
+                "type": "s3",
+                "bucket": "knova-models",
+                "prefix": "tenant/model/version/",
+            },
+        }
+    )
+
+    config = request.resolve_training_config()
+
+    assert config["data"]["type"] == "clickhouse"
+    assert config["data"]["feature_columns"] == ["x1", "x2"]
+    assert config["data"]["feature_id_map"] == {"x1": "f1", "x2": "f2"}
+    assert config["model"]["eta"] == 0.08
+    assert "learning_rate" not in config["model"]
+    assert config["training"] == {
+        "num_rounds": 100,
+        "val_size": 0.1,
+        "test_size": 0.2,
+        "seed": 7,
+        "early_stopping_rounds": 9,
+    }
+    assert config["ray"]["storage_path"] == (
+        "s3://knova-models/tenant/model/version/_ray"
+    )
+    assert config["output"] == {"bundle_uri": "s3://knova-models/tenant/model/version"}
+
+
+def test_canonical_request_requires_fields_needed_before_ray_submission() -> None:
+    with pytest.raises(ValueError, match="datasource.host"):
+        TrainingJobRequest.model_validate(
+            {
+                "job_id": "job-1",
+                "features": [{"result_column": "x1"}],
+                "target": {"result_column": "label"},
+                "storage_context": {
+                    "type": "local",
+                    "prefix": "/tmp/bundles/",
+                },
+            }
+        ).resolve_training_config()
 
 
 def test_redis_config_supports_modes_and_rejects_missing_topology() -> None:

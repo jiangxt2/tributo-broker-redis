@@ -64,6 +64,7 @@ def _result_from_summary(
     run_id: str | None,
     attempt_id: str | None,
     execution_id: str | None,
+    submission_id: str | None,
 ) -> JobResult:
     """Convert the trainer summary into a broker-neutral completion result."""
     raw_metrics = summary.get("metrics")
@@ -84,6 +85,7 @@ def _result_from_summary(
         run_id=run_id,
         attempt_id=attempt_id,
         execution_id=execution_id,
+        submission_id=submission_id,
         metrics={
             key: float(value)
             for key, value in metrics.items()
@@ -107,6 +109,12 @@ def _result_from_summary(
             else None
         ),
     )
+
+
+def _worker_job_identity() -> tuple[str | None, str | None]:
+    """Return the Ray execution lookup token and deterministic submission ID."""
+    submission_id = os.environ.get("TRIBUTO_SUBMISSION_ID")
+    return os.environ.get("RAY_JOB_ID") or submission_id, submission_id
 
 
 def main() -> int:
@@ -142,12 +150,14 @@ def main() -> int:
             reporter.report_cancelled(job_id, "TRAINING")
             return 0
         _emit_history(reporter, job_id, summary)
+        execution_id, submission_id = _worker_job_identity()
         result = _result_from_summary(
             job_id,
             summary,
             run_id=os.environ.get("TRIBUTO_RUN_ID"),
             attempt_id=os.environ.get("TRIBUTO_ATTEMPT_ID"),
-            execution_id=os.environ.get("RAY_JOB_ID"),
+            execution_id=execution_id,
+            submission_id=submission_id,
         )
         reporter.report_completed(job_id, result)
         return 0

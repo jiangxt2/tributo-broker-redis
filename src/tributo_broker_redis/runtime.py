@@ -122,7 +122,7 @@ class RedisBrokerRuntime(BrokerRuntime):
         reporter = RedisEventReporter(self._redis, self.config, message.job_id)
         try:
             request = TrainingJobRequest.model_validate(request_data)
-            training_config = request.require_training_config()
+            training_config = request.resolve_training_config()
         except Exception as exc:
             return self._report_invalid(message, str(exc), "INVALID_PAYLOAD")
 

@@ -184,6 +184,7 @@ def test_training_summary_bridges_bundle_and_metric_fields() -> None:
         run_id="job-1",
         attempt_id="attempt-1",
         execution_id="ray-job-1",
+        submission_id="submission-1",
     )
     assert result.bundle_id == "bundle-1"
     assert result.bundle_uri == "/models/bundle-1"
@@ -191,3 +192,4 @@ def test_training_summary_bridges_bundle_and_metric_fields() -> None:
     assert result.metrics == {"accuracy": 0.9}
     assert result.artifacts == ["onnx-model"]
     assert result.artifact_refs == [{"name": "onnx-model", "format": "onnx"}]
+    assert result.submission_id == "submission-1"
