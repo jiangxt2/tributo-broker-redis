@@ -1,0 +1,59 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  ray-head:
+    image: ray-cluster:2.55.1
+    pull_policy: never
+    command:
+      - ray
+      - start
+      - --head
+      - --port=6379
+      - --dashboard-host=0.0.0.0
+      - --num-cpus=2
+      - --block
+    ports:
+      - "18265:8265"
+    volumes:
+      - ${BROKER_WHEEL_DIR:?BROKER_WHEEL_DIR is required}:/provider:ro
+      - ${BROKER_RAY_STORAGE_DIR:?BROKER_RAY_STORAGE_DIR is required}:/tmp/ray_results
+      - ${BROKER_FIXTURE_DIR:?BROKER_FIXTURE_DIR is required}:/provider-data:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8265/api/version', timeout=2).read()"
+          >/dev/null 2>&1
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 15s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  ray-worker:
+    image: ray-cluster:2.55.1
+    pull_policy: never
+    command:
+      - ray
+      - start
+      - --address=ray-head:6379
+      - --num-cpus=2
+      - --block
+    volumes:
+      - ${BROKER_WHEEL_DIR:?BROKER_WHEEL_DIR is required}:/provider:ro
+      - ${BROKER_RAY_STORAGE_DIR:?BROKER_RAY_STORAGE_DIR is required}:/tmp/ray_results
+      - ${BROKER_FIXTURE_DIR:?BROKER_FIXTURE_DIR is required}:/provider-data:ro
+    depends_on:
+      ray-head:
+        condition: service_healthy

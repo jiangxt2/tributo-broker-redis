@@ -1,0 +1,25 @@
+{
+  "mode": "standalone",
+  "url": "redis://redis.example:6379",
+  "password_env": "KNOVA_REDIS_PASSWORD",
+  "worker_password_env": "KNOVA_REDIS_PASSWORD",
+  "sentinel_address_map": {},
+  "cluster_address_remap_host": null,
+  "task_stream_key": "knova:training:tasks",
+  "event_stream_prefix": "knova:training:events",
+  "invalid_event_stream_key": "knova:training:events:invalid",
+  "cancel_key_prefix": "knova:training:cancel",
+  "consumer_group": "tributo",
+  "group_start_id": "$",
+  "block_ms": 5000,
+  "claim_idle_ms": 60000,
+  "claim_count": 10,
+  "max_stream_length": 1000,
+  "max_payload_bytes": 1048576,
+  "max_event_bytes": 1048576,
+  "ray_dashboard_url": "http://ray-head:8265",
+  "extra_py_modules": [],
+  "runtime_pip_packages": [
+    "/provider/tributo_broker_redis-<version>-py3-none-any.whl"
+  ]
+}

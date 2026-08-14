@@ -1,0 +1,142 @@
+services:
+  sentinel-master:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--port",
+        "16380",
+        "--protected-mode",
+        "no",
+        "--appendonly",
+        "yes"
+      ]
+    ports:
+      - "16380:16380"
+
+  sentinel-replica:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--protected-mode",
+        "no",
+        "--replicaof",
+        "sentinel-master",
+        "16380"
+      ]
+    depends_on:
+      - sentinel-master
+    ports:
+      - "16381:6379"
+
+  sentinel:
+    image: redis:7-alpine
+    command:
+      - sh
+      - -c
+      - >-
+        master_ip=$$(getent hosts sentinel-master | sed -n '1s/[[:space:]].*$//p') &&
+        printf '%s\n'
+        'port 26379'
+        "sentinel monitor mymaster $$master_ip 16380 1"
+        'sentinel down-after-milliseconds mymaster 1000'
+        'sentinel failover-timeout mymaster 10000'
+        'sentinel parallel-syncs mymaster 1'
+        > /tmp/sentinel.conf &&
+        exec redis-server /tmp/sentinel.conf --sentinel
+    ports:
+      - "26380:26379"
+    depends_on:
+      - sentinel-master
+      - sentinel-replica
+
+  cluster-1:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--port",
+        "7000",
+        "--protected-mode",
+        "no",
+        "--cluster-enabled",
+        "yes",
+        "--cluster-config-file",
+        "/data/nodes.conf",
+        "--cluster-node-timeout",
+        "5000",
+        "--cluster-require-full-coverage",
+        "no",
+        "--cluster-announce-ip",
+        "${BROKER_CLUSTER_ANNOUNCE_IP:?BROKER_CLUSTER_ANNOUNCE_IP is required}",
+        "--cluster-announce-port",
+        "17000",
+        "--cluster-announce-bus-port",
+        "27000"
+      ]
+    ports:
+      - "17000:7000"
+      - "27000:17000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  cluster-2:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--port",
+        "7000",
+        "--protected-mode",
+        "no",
+        "--cluster-enabled",
+        "yes",
+        "--cluster-config-file",
+        "/data/nodes.conf",
+        "--cluster-node-timeout",
+        "5000",
+        "--cluster-require-full-coverage",
+        "no",
+        "--cluster-announce-ip",
+        "${BROKER_CLUSTER_ANNOUNCE_IP:?BROKER_CLUSTER_ANNOUNCE_IP is required}",
+        "--cluster-announce-port",
+        "17001",
+        "--cluster-announce-bus-port",
+        "27001"
+      ]
+    ports:
+      - "17001:7000"
+      - "27001:17000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  cluster-3:
+    image: redis:7-alpine
+    command:
+      [
+        "redis-server",
+        "--port",
+        "7000",
+        "--protected-mode",
+        "no",
+        "--cluster-enabled",
+        "yes",
+        "--cluster-config-file",
+        "/data/nodes.conf",
+        "--cluster-node-timeout",
+        "5000",
+        "--cluster-require-full-coverage",
+        "no",
+        "--cluster-announce-ip",
+        "${BROKER_CLUSTER_ANNOUNCE_IP:?BROKER_CLUSTER_ANNOUNCE_IP is required}",
+        "--cluster-announce-port",
+        "17002",
+        "--cluster-announce-bus-port",
+        "27002"
+      ]
+    ports:
+      - "17002:7000"
+      - "27002:17000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

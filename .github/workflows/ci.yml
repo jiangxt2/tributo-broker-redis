@@ -1,0 +1,45 @@
+name: Provider CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Keep CI on the same Broker API branch used by the local wheel IT until
+  # that Core line is published to the package index.
+  TRIBUTO_CORE_REPOSITORY: jiangxt2/Tributo
+  TRIBUTO_CORE_REF: feat/redis-stream-integration
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Checkout compatible Tributo Core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TRIBUTO_CORE_REPOSITORY }}
+          ref: ${{ env.TRIBUTO_CORE_REF }}
+          path: tributo-core
+      - name: Build and install Core and provider
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel --no-deps --wheel-dir dist/core ./tributo-core
+          python -m pip install dist/core/tributo-*.whl '.[dev]'
+      - name: Ruff format
+        run: ruff format --check .
+      - name: Ruff lint
+        run: ruff check .
+      - name: Mypy
+        run: mypy src tests/unit
+      - name: Suppression check
+        run: ./scripts/check_suppressions.sh
+      - name: Unit tests
+        run: python -m pytest -q tests/unit
+      - name: Wheel entry-point discovery
+        run: python -m pytest -q tests/integration/test_broker_redis_wheel.py -m integration
+      - name: Wheel build
+        run: python -m pip wheel --no-deps --wheel-dir dist .
