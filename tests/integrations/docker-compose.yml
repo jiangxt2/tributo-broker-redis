@@ -1,6 +1,7 @@
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+    pull_policy: never
     ports:
       - "16379:6379"
     healthcheck:
@@ -10,7 +11,7 @@ services:
       retries: 30
 
   ray-head:
-    image: ray-cluster:2.55.1
+    image: ${BROKER_RAY_IMAGE:?BROKER_RAY_IMAGE is required}
     pull_policy: never
     command:
       - ray
@@ -26,6 +27,8 @@ services:
       - ${BROKER_WHEEL_DIR:?BROKER_WHEEL_DIR is required}:/provider:ro
       - ${BROKER_RAY_STORAGE_DIR:?BROKER_RAY_STORAGE_DIR is required}:/tmp/ray_results
       - ${BROKER_FIXTURE_DIR:?BROKER_FIXTURE_DIR is required}:/provider-data:ro
+    environment:
+      TRIBUTO_TEST_SECRET: integration-secret-must-not-leak
     healthcheck:
       test:
         - CMD-SHELL
@@ -42,7 +45,7 @@ services:
         condition: service_healthy
 
   ray-worker:
-    image: ray-cluster:2.55.1
+    image: ${BROKER_RAY_IMAGE:?BROKER_RAY_IMAGE is required}
     pull_policy: never
     command:
       - ray
@@ -54,6 +57,8 @@ services:
       - ${BROKER_WHEEL_DIR:?BROKER_WHEEL_DIR is required}:/provider:ro
       - ${BROKER_RAY_STORAGE_DIR:?BROKER_RAY_STORAGE_DIR is required}:/tmp/ray_results
       - ${BROKER_FIXTURE_DIR:?BROKER_FIXTURE_DIR is required}:/provider-data:ro
+    environment:
+      TRIBUTO_TEST_SECRET: integration-secret-must-not-leak
     depends_on:
       ray-head:
         condition: service_healthy

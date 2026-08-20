@@ -1,25 +1,58 @@
 {
-  "mode": "standalone",
-  "url": "redis://redis.example:6379",
-  "password_env": "KNOVA_REDIS_PASSWORD",
-  "worker_password_env": "KNOVA_REDIS_PASSWORD",
-  "sentinel_address_map": {},
-  "cluster_address_remap_host": null,
-  "task_stream_key": "knova:training:tasks",
-  "event_stream_prefix": "knova:training:events",
-  "invalid_event_stream_key": "knova:training:events:invalid",
-  "cancel_key_prefix": "knova:training:cancel",
-  "consumer_group": "tributo",
-  "group_start_id": "$",
-  "block_ms": 5000,
-  "claim_idle_ms": 60000,
-  "claim_count": 10,
-  "max_stream_length": 1000,
-  "max_payload_bytes": 1048576,
-  "max_event_bytes": 1048576,
-  "ray_dashboard_url": "http://ray-head:8265",
-  "extra_py_modules": [],
-  "runtime_pip_packages": [
-    "/provider/tributo_broker_redis-<version>-py3-none-any.whl"
-  ]
+  "broker_id": "tributo-redis",
+  "api_version": 1,
+  "transport": {
+    "mode": "standalone",
+    "url": "redis://127.0.0.1:6379/0",
+    "driver_url": "redis://host.docker.internal:6379/0",
+    "block_ms": 1000,
+    "claim_idle_ms": 60000,
+    "claim_count": 10,
+    "max_payload_bytes": 1048576,
+    "max_event_bytes": 1048576,
+    "max_stream_length": 1000
+  },
+  "channels": {
+    "training": {
+      "task_stream_key": "tributo:training:tasks",
+      "event_stream_prefix": "tributo:training:events",
+      "cancel_key_prefix": "tributo:training:cancel",
+      "consumer_group": "tributo-training",
+      "consumer_name": "training-consumer",
+      "group_start_id": "0-0",
+      "outer_identity_field": "operation_id"
+    },
+    "batch_inference": {
+      "task_stream_key": "tributo:batch-inference:tasks",
+      "event_stream_prefix": "tributo:batch-inference:events",
+      "cancel_key_prefix": "tributo:batch-inference:cancel",
+      "consumer_group": "tributo-batch-inference",
+      "consumer_name": "batch-inference-consumer",
+      "group_start_id": "0-0",
+      "outer_identity_field": "operation_id"
+    }
+  },
+  "protocol": {
+    "profile": "tributo-generic-v1",
+    "protocol_version": "1.0"
+  },
+  "operations": {
+    "training": {
+      "execution_profiles": ["single_worker", "distributed"]
+    },
+    "batch_inference": {
+      "execution_profiles": ["single_worker", "distributed"]
+    }
+  },
+  "execution": {
+    "ray_dashboard_url": "http://127.0.0.1:8265",
+    "project_root": "/opt/tributo-core",
+    "extra_py_modules": [],
+    "runtime_pip_packages": [
+      "/provider/tributo_broker_redis-0.1.0-py3-none-any.whl"
+    ],
+    "env_vars": {},
+    "cancel_poll_interval_seconds": 0.5,
+    "entrypoint_num_cpus": 1.0
+  }
 }

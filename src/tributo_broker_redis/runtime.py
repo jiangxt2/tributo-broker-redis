@@ -1,223 +1,420 @@
-"""Redis provider runtime mapping protocol tasks to Tributo Ray Jobs."""
+"""Provider-owned dual-channel consume loop and Ray Job admission."""
 
 from __future__ import annotations
 
-import json
+import base64
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from tributo.integrations.broker import (
+    BrokerError,
     BrokerRuntime,
-    CancellationSpec,
-    JobResult,
     Message,
     TaskDisposition,
     TaskOutcome,
 )
-from tributo.training.job_submitter import submit_training_job_with_identity
+from tributo.ray_jobs import RayJobSubmission, submit_ray_job
 
-from tributo_broker_redis.config import RedisBrokerConfig
+from tributo_broker_redis.cancellation import (
+    ActiveSubmission,
+    ActiveSubmissionMap,
+    CancelWatcher,
+)
+from tributo_broker_redis.config import (
+    ExecutionProfile,
+    OperationType,
+    RedisBrokerConfig,
+    normalize_config,
+)
 from tributo_broker_redis.consumer import RedisTaskConsumer
+from tributo_broker_redis.operations import MappingFailure, prepare_operation
 from tributo_broker_redis.protocol import (
-    TrainingJobRequest,
-    check_protocol_version,
-    is_training_task,
+    DriverInput,
+    ProtocolFailure,
+    parse_request,
 )
 from tributo_broker_redis.redis_client import create_redis_client
 from tributo_broker_redis.reporter import RedisEventReporter
 
 logger = logging.getLogger(__name__)
+_DRIVER_ENV = "TRIBUTO_REDIS_DRIVER_INPUT_B64"
+_MAX_DRIVER_INPUT_BYTES = 64 * 1024
+
+
+def validate_execution_environment(
+    config: RedisBrokerConfig,
+) -> None:
+    """Fail before Redis consumption when the Ray driver cannot be distributed."""
+    root = Path(config.execution.project_root).expanduser().resolve()
+    if not root.is_dir() or not (
+        (root / "src" / "tributo").is_dir() or (root / "tributo").is_dir()
+    ):
+        raise ValueError(
+            "execution.project_root must contain the Tributo package in "
+            "src/tributo or tributo"
+        )
+    for module in config.execution.extra_py_modules:
+        if "://" not in module and not Path(module).expanduser().exists():
+            raise ValueError("execution.extra_py_modules contains a missing local path")
 
 
 class RedisBrokerRuntime(BrokerRuntime):
-    """Provider runtime preserving the internal task/submit/event flow."""
+    """Healthy-path runtime for training and batch inference channels."""
 
-    def __init__(self, config: RedisBrokerConfig) -> None:
+    def __init__(
+        self,
+        config: RedisBrokerConfig,
+        *,
+        submitter: Callable[..., RayJobSubmission] = submit_ray_job,
+        redis_client: Any | None = None,
+        start_cancel_watcher: bool = False,
+    ) -> None:
         self.config = config
-        self._redis = create_redis_client(config)
-        self._consumer = RedisTaskConsumer(self._redis, config)
+        self._submitter = submitter
+        validate_execution_environment(config)
+        self._redis = redis_client or create_redis_client(config)
+        self._consumers: dict[OperationType, RedisTaskConsumer] = {
+            operation_type: RedisTaskConsumer(
+                self._redis,
+                config.transport,
+                config.channels.for_operation(operation_type),
+                operation_type,
+            )
+            for operation_type in ("training", "batch_inference")
+        }
+        self.active_submissions = ActiveSubmissionMap()
+        self._cancel_watcher = CancelWatcher(
+            self._redis,
+            self.active_submissions,
+            dashboard_url=config.execution.ray_dashboard_url,
+            interval_seconds=config.execution.cancel_poll_interval_seconds,
+            max_event_bytes=config.transport.max_event_bytes,
+            max_stream_length=config.transport.max_stream_length,
+        )
+        self._next_channel = 0
+        self._closed = False
+        if start_cancel_watcher:
+            self._cancel_watcher.start()
 
     @property
     def consumer(self) -> RedisTaskConsumer:
-        return self._consumer
+        """Return one consumer only for the minimal Core contract surface."""
+        return self._consumers["training"]
 
-    def _report_invalid(
+    @property
+    def consumers(self) -> Mapping[OperationType, RedisTaskConsumer]:
+        return self._consumers
+
+    def start(self) -> None:
+        self._cancel_watcher.start()
+
+    def _reporter(
+        self,
+        *,
+        operation_id: str,
+        operation_type: OperationType,
+        execution_profile: ExecutionProfile,
+        run_id: str,
+        attempt_id: str,
+        submission: RayJobSubmission | None = None,
+    ) -> RedisEventReporter:
+        channel = self.config.channels.for_operation(operation_type)
+        return RedisEventReporter(
+            self._redis,
+            event_stream_prefix=channel.event_stream_prefix,
+            operation_id=operation_id,
+            operation_type=operation_type,
+            execution_profile=execution_profile,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            submission_id=submission.submission_id if submission else None,
+            ray_job_id=submission.ray_job_id if submission else None,
+            outer_identity_field=channel.outer_identity_field,
+            max_event_bytes=self.config.transport.max_event_bytes,
+            max_stream_length=self.config.transport.max_stream_length,
+        )
+
+    def _invalid(
         self,
         message: Message,
-        error: str,
+        *,
+        operation_type: OperationType,
         code: str,
+        sanitized_message: str,
+        execution_profile: ExecutionProfile = "single_worker",
+        run_id: str | None = None,
+        attempt_id: str = "attempt-1",
     ) -> TaskOutcome:
-        reporter = RedisEventReporter(
-            self._redis,
-            self.config,
-            message.job_id,
-            stream_key=(
-                self.config.invalid_event_stream_key if not message.job_id else None
-            ),
+        operation_id = message.metadata.get("outer_operation_id") or (
+            f"invalid-{message.delivery_token}"
         )
-        # Invalid messages must leave the queue even if FAILED publication is
-        # unavailable.  The outcome is ACK independent of reporter success.
-        reporter.report_failed_with_code(
-            message.job_id,
-            error,
-            code,
-            delivery_id=message.delivery_id,
-        )
+        try:
+            self._reporter(
+                operation_id=operation_id,
+                operation_type=operation_type,
+                execution_profile=execution_profile,
+                run_id=run_id or operation_id,
+                attempt_id=attempt_id,
+            ).publish(
+                "FAILED",
+                {
+                    "error_code": code,
+                    "sanitized_message": sanitized_message,
+                    "retryable": False,
+                },
+                phase="ADMISSION",
+            )
+        except Exception:
+            logger.warning(
+                "Could not publish invalid-request event: delivery=%s code=%s",
+                message.delivery_token,
+                code,
+                exc_info=True,
+            )
         return TaskOutcome(
-            disposition=TaskDisposition.ACK,
-            error=error,
+            TaskDisposition.ACK,
+            BrokerError(code=code, sanitized_message=sanitized_message),
         )
 
     def handle(self, message: Message) -> TaskOutcome:
-        if not message.job_id:
-            return self._report_invalid(
+        operation_type = cast(OperationType, message.metadata["operation_type"])
+        outer_operation_id = message.metadata.get("outer_operation_id", "")
+        if not outer_operation_id:
+            return self._invalid(
                 message,
-                "Missing or invalid outer Redis job_id",
-                "INVALID_JOB_ID",
+                operation_type=operation_type,
+                code="INVALID_OPERATION_ID",
+                sanitized_message="outer operation_id is required",
             )
-        payload_error = message.metadata.get("payload_error")
-        if isinstance(payload_error, str) and payload_error:
-            return self._report_invalid(message, payload_error, "PAYLOAD_TOO_LARGE")
-        raw_payload = message.payload.get("raw")
-        if not isinstance(raw_payload, str):
-            return self._report_invalid(
+        if message.metadata.get("envelope_error"):
+            return self._invalid(
                 message,
-                "payload must be a JSON string",
-                "INVALID_PAYLOAD",
-            )
-        try:
-            request_data = json.loads(raw_payload)
-        except json.JSONDecodeError:
-            return self._report_invalid(
-                message,
-                "Invalid JSON payload",
-                "INVALID_PAYLOAD",
-            )
-        if not isinstance(request_data, dict):
-            return self._report_invalid(
-                message,
-                "Payload root must be an object",
-                "INVALID_PAYLOAD",
-            )
-
-        version_error = check_protocol_version(request_data)
-        if version_error:
-            return self._report_invalid(
-                message,
-                version_error,
-                "UNSUPPORTED_PROTOCOL_VERSION",
-            )
-        if not is_training_task(request_data):
-            return self._report_invalid(
-                message,
-                "Only training tasks are supported by broker v1",
-                "UNSUPPORTED_TASK_TYPE",
-            )
-
-        # The outer Redis field is authoritative for event/cancel/idempotency
-        # identity, matching the internal consumer behavior.
-        request_data["job_id"] = message.job_id
-        reporter = RedisEventReporter(self._redis, self.config, message.job_id)
-        try:
-            request = TrainingJobRequest.model_validate(request_data)
-            training_config = request.resolve_training_config()
-        except Exception as exc:
-            return self._report_invalid(message, str(exc), "INVALID_PAYLOAD")
-
-        if self._is_cancelled(message.job_id):
-            reporter.report_cancelled(message.job_id, "QUEUED")
-            return TaskOutcome(disposition=TaskDisposition.ACK)
-
-        # Redis delivery attempts are transport retries, not new Ray
-        # execution attempts.  Reuse the same deterministic submission ID
-        # after an ACK failure so a pending redelivery cannot create a second
-        # Ray Job for the same business run.
-        attempt_id = "attempt-1"
-        cancellation = CancellationSpec(
-            broker_id="knova-redis",
-            job_id=message.job_id,
-            options={"config_env": "TRIBUTO_BROKER_CONFIG_JSON"},
-        )
-        execution_context = {"cancellation": cancellation.as_dict()}
-        reporter.report_phase(message.job_id, "QUEUED")
-        try:
-            entrypoint = "python -m tributo_broker_redis.run_training"
-            env_vars = dict(self.config.env_vars)
-            env_vars["TRIBUTO_BROKER_REQUEST_JSON"] = json.dumps(
-                request_data,
-                separators=(",", ":"),
-            )
-            worker_config = self.config.model_dump(
-                exclude={"env_vars", "worker_url", "extra_py_modules"}
-            )
-            if self.config.worker_url:
-                worker_config["url"] = self.config.worker_url
-            worker_config["password_env"] = (
-                self.config.worker_password_env or self.config.password_env
-            )
-            worker_config.pop("worker_password_env", None)
-            env_vars["TRIBUTO_BROKER_CONFIG_JSON"] = json.dumps(
-                worker_config,
-                separators=(",", ":"),
-            )
-            env_vars["TRIBUTO_TRAINING_CONFIG_JSON"] = json.dumps(
-                training_config,
-                separators=(",", ":"),
-            )
-            extra_py_modules: list[str | Path] = list(self.config.extra_py_modules)
-            submission = submit_training_job_with_identity(
-                entrypoint,
-                dashboard_url=self.config.ray_dashboard_url,
-                env_vars=env_vars,
-                project_root=(
-                    Path(self.config.project_root) if self.config.project_root else None
+                operation_type=operation_type,
+                code="INVALID_ENVELOPE",
+                sanitized_message=(
+                    "task envelope must contain only identity and payload"
                 ),
-                run_id=message.job_id,
-                attempt_id=attempt_id,
-                extra_py_modules=extra_py_modules,
-                runtime_pip_packages=self.config.runtime_pip_packages,
-                execution_context=execution_context,
             )
-        except Exception as exc:
+        if message.metadata.get("payload_error"):
+            return self._invalid(
+                message,
+                operation_type=operation_type,
+                code="PAYLOAD_TOO_LARGE",
+                sanitized_message="payload exceeds configured size limit",
+            )
+        raw = message.payload.get("raw") if isinstance(message.payload, dict) else None
+        if not isinstance(raw, str):
+            return self._invalid(
+                message,
+                operation_type=operation_type,
+                code="INVALID_REQUEST",
+                sanitized_message="payload must be a JSON string",
+            )
+        try:
+            request = parse_request(
+                raw,
+                outer_operation_id=outer_operation_id,
+                expected_operation_type=operation_type,
+            )
+        except ProtocolFailure as exc:
+            return self._invalid(
+                message,
+                operation_type=operation_type,
+                code=exc.code,
+                sanitized_message=exc.sanitized_message,
+            )
+        try:
+            operation_config = self.config.operations.for_operation(operation_type)
+            if request.execution_profile not in operation_config.execution_profiles:
+                raise MappingFailure(
+                    "UNSUPPORTED_EXECUTION_PROFILE",
+                    "execution profile is disabled by provider configuration",
+                )
+            prepared = prepare_operation(request)
+        except MappingFailure as exc:
+            return self._invalid(
+                message,
+                operation_type=operation_type,
+                code=exc.code,
+                sanitized_message=exc.sanitized_message,
+                execution_profile=request.execution_profile,
+                run_id=request.run_id or request.operation_id,
+                attempt_id=request.attempt_id,
+            )
+
+        channel = self.config.channels.for_operation(operation_type)
+        run_id = request.run_id or request.operation_id
+        reporter = self._reporter(
+            operation_id=request.operation_id,
+            operation_type=operation_type,
+            execution_profile=request.execution_profile,
+            run_id=run_id,
+            attempt_id=request.attempt_id,
+        )
+        try:
+            if bool(self._redis.exists(channel.cancel_key(request.operation_id))):
+                reporter.publish(
+                    "CANCELLED",
+                    {"reason": "cancelled before admission"},
+                    phase="QUEUED",
+                )
+                return TaskOutcome(TaskDisposition.ACK)
+        except Exception:
+            return TaskOutcome(
+                TaskDisposition.RETRY,
+                BrokerError(
+                    code="CANCEL_CHECK_UNAVAILABLE",
+                    sanitized_message="queued cancellation check unavailable",
+                ),
+            )
+
+        namespace = f"redis-{operation_type.replace('_', '-')}"
+        driver_input = DriverInput(
+            operation_id=request.operation_id,
+            operation_type=operation_type,
+            execution_profile=request.execution_profile,
+            run_id=run_id,
+            attempt_id=request.attempt_id,
+            credential_ref=prepared.credential_ref,
+            operation_payload=prepared.operation_payload,
+            redis_url=self.config.transport.ray_driver_url,
+            event_stream_prefix=channel.event_stream_prefix,
+            outer_identity_field=channel.outer_identity_field,
+            max_event_bytes=self.config.transport.max_event_bytes,
+            max_stream_length=self.config.transport.max_stream_length,
+        )
+        encoded_driver_input = base64.urlsafe_b64encode(
+            driver_input.model_dump_json().encode("utf-8")
+        ).decode("ascii")
+        if len(encoded_driver_input.encode("ascii")) > _MAX_DRIVER_INPUT_BYTES:
+            return self._invalid(
+                message,
+                operation_type=operation_type,
+                code="DRIVER_INPUT_TOO_LARGE",
+                sanitized_message="validated driver input exceeds transport limit",
+            )
+
+        env_vars = dict(self.config.execution.env_vars)
+        env_vars[_DRIVER_ENV] = encoded_driver_input
+        try:
+            submission = self._submitter(
+                "python -m tributo_broker_redis.execution_driver",
+                operation_namespace=namespace,
+                run_id=run_id,
+                attempt_id=request.attempt_id,
+                dashboard_url=self.config.execution.ray_dashboard_url,
+                env_vars=env_vars,
+                project_root=Path(self.config.execution.project_root)
+                .expanduser()
+                .resolve(),
+                extra_py_modules=[
+                    module
+                    if "://" in module
+                    else str(Path(module).expanduser().resolve())
+                    for module in self.config.execution.extra_py_modules
+                ],
+                runtime_pip_packages=list(self.config.execution.runtime_pip_packages),
+                metadata={
+                    "tributo.operation_id": request.operation_id,
+                    "tributo.operation_type": operation_type,
+                    "tributo.execution_profile": request.execution_profile,
+                    "tributo.protocol_profile": request.protocol_profile,
+                },
+                request_digest=request.request_digest,
+                entrypoint_num_cpus=self.config.execution.entrypoint_num_cpus,
+            )
+            active = ActiveSubmission(
+                operation_id=request.operation_id,
+                operation_type=operation_type,
+                execution_profile=request.execution_profile,
+                run_id=run_id,
+                channel=channel,
+                submission=submission,
+            )
+            self.active_submissions.put(active)
+            self._reporter(
+                operation_id=request.operation_id,
+                operation_type=operation_type,
+                execution_profile=request.execution_profile,
+                run_id=run_id,
+                attempt_id=request.attempt_id,
+                submission=submission,
+            ).publish(
+                "ACCEPTED",
+                {
+                    "submission_id": submission.submission_id,
+                    "ray_job_id": submission.ray_job_id,
+                },
+                phase="ADMITTED",
+            )
+        except Exception:
             logger.warning(
-                "Ray submission failed; leaving task pending: job_id=%s",
-                message.job_id,
+                "Ray admission is not confirmed: operation_id=%s",
+                request.operation_id,
                 exc_info=True,
             )
             return TaskOutcome(
-                disposition=TaskDisposition.RETRY,
-                error=str(exc),
+                TaskDisposition.RETRY,
+                BrokerError(
+                    code="RAY_ADMISSION_UNKNOWN",
+                    sanitized_message="Ray admission could not be confirmed",
+                ),
             )
+        return TaskOutcome(TaskDisposition.ACK)
 
-        reporter.report_phase(message.job_id, "LOADING_DATA")
-        return TaskOutcome(
-            disposition=TaskDisposition.ACK,
-            result=JobResult(
-                job_id=message.job_id,
-                status="accepted",
-                run_id=submission.run_id,
-                attempt_id=submission.attempt_id,
-                execution_id=submission.job_id,
-                submission_id=submission.submission_id,
-            ),
+    def _apply_outcome(
+        self, consumer: RedisTaskConsumer, message: Message, outcome: TaskOutcome
+    ) -> None:
+        if outcome.disposition == TaskDisposition.ACK:
+            consumer.ack(message)
+        elif outcome.disposition == TaskDisposition.RETRY:
+            consumer.retry(message, outcome.error)
+        else:
+            consumer.reject(message, outcome.error)
+
+    def run_once(self, timeout_ms: int | None = None) -> bool:
+        operations: tuple[OperationType, ...] = ("training", "batch_inference")
+        per_channel_timeout = (
+            self.config.transport.block_ms
+            if timeout_ms is None
+            else max(0, timeout_ms // len(operations))
         )
+        for offset in range(len(operations)):
+            index = (self._next_channel + offset) % len(operations)
+            operation_type = operations[index]
+            consumer = self._consumers[operation_type]
+            message = consumer.poll(per_channel_timeout)
+            if message is None:
+                continue
+            outcome = self.handle(message)
+            self._apply_outcome(consumer, message, outcome)
+            self._next_channel = (index + 1) % len(operations)
+            return True
+        return False
 
-    def _is_cancelled(self, job_id: str) -> bool:
-        try:
-            return bool(self._redis.exists(self.config.cancel_key(job_id)))
-        except Exception:
-            logger.warning(
-                "Redis cancel check unavailable; continuing task: job_id=%s",
-                job_id,
-                exc_info=True,
-            )
-            return False
+    def run_forever(self) -> None:
+        self.start()
+        while not self._closed:
+            self.run_once()
 
     def close(self) -> None:
-        self._consumer.close()
+        if self._closed:
+            return
+        self._closed = True
+        self._cancel_watcher.close()
+        close = getattr(self._redis, "close", None)
+        if callable(close):
+            close()
 
 
 def create_runtime(config: Mapping[str, Any]) -> RedisBrokerRuntime:
-    return RedisBrokerRuntime(RedisBrokerConfig.from_mapping(dict(config)))
+    return RedisBrokerRuntime(normalize_config(config))
+
+
+__all__ = [
+    "RedisBrokerRuntime",
+    "create_runtime",
+    "validate_execution_environment",
+]

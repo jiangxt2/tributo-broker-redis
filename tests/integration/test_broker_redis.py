@@ -1,33 +1,36 @@
-"""Real Redis Streams and Docker Ray integration tests for the provider."""
+"""Real Standalone Redis -> provider -> Ray -> result/event matrix."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import socket
 import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import pyarrow as pa
+import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
 import pytest
 import redis
 from ray.job_submission import JobStatus, JobSubmissionClient
-from tributo.integrations.broker import CancellationSpec, Message, TaskDisposition
-from tributo.integrations.broker_runner import BrokerRunner, BrokerRunnerState
+from tributo.exporting import load_bundle
 
-from tributo_broker_redis.config import RedisBrokerConfig
-from tributo_broker_redis.consumer import RedisTaskConsumer
-from tributo_broker_redis.plugin import RedisBrokerPlugin
+from tributo_broker_redis.config import OperationType, RedisBrokerConfig
+from tributo_broker_redis.runtime import RedisBrokerRuntime
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
+_TERMINAL_EVENTS = {"COMPLETED", "FAILED", "CANCELLED"}
+_SECRET = "integration-secret-must-not-leak"
 
 
 @pytest.fixture(scope="module")
 def redis_client() -> Iterator[redis.Redis]:
     client = redis.Redis.from_url(
-        os.environ.get("BROKER_REDIS_URL", "redis://127.0.0.1:16379"),
+        os.environ.get("BROKER_REDIS_URL", "redis://127.0.0.1:16379/0"),
         decode_responses=True,
     )
     client.ping()
@@ -38,641 +41,447 @@ def redis_client() -> Iterator[redis.Redis]:
 @pytest.fixture(scope="module")
 def provider_config() -> RedisBrokerConfig:
     suffix = uuid.uuid4().hex
-    worker_url = os.environ.get(
-        "BROKER_REDIS_WORKER_URL",
-        "redis://host.docker.internal:16379",
-    )
-    wheel_name = os.environ.get("BROKER_PROVIDER_WHEEL_NAME")
-    if not wheel_name:
-        pytest.fail("BROKER_PROVIDER_WHEEL_NAME is required for wheel-only IT")
-    project_root = os.environ.get("BROKER_PROJECT_ROOT")
-    if not project_root:
-        pytest.fail("BROKER_PROJECT_ROOT is required for Ray Jobs IT")
-    return RedisBrokerConfig(
-        url=os.environ.get("BROKER_REDIS_URL", "redis://127.0.0.1:16379"),
-        worker_url=worker_url,
-        task_stream_key=f"it:broker:tasks:{suffix}",
-        event_stream_prefix=f"it:broker:events:{suffix}",
-        cancel_key_prefix=f"it:broker:cancel:{suffix}",
-        consumer_group=f"it-group-{suffix}",
-        consumer_name=f"it-consumer-{suffix}",
-        block_ms=100,
-        claim_idle_ms=0,
-        group_start_id="0-0",
-        max_publish_retries=2,
-        publish_retry_delay=0,
-        ray_dashboard_url=os.environ.get(
-            "BROKER_RAY_DASHBOARD_URL", "http://127.0.0.1:18265"
-        ),
-        project_root=project_root,
-        runtime_pip_packages=[f"/provider/{wheel_name}"],
-    )
-
-
-def _events(client: redis.Redis, stream: str) -> list[dict[str, Any]]:
-    payloads = []
-    for _id, entry in client.xrange(stream):
-        payload = entry.get("payload", entry.get(b"payload"))
-        if isinstance(payload, bytes):
-            payload = payload.decode()
-        payloads.append(json.loads(payload))
-    return payloads
-
-
-def _task_payload(
-    job_id: str,
-    *,
-    num_rounds: int = 2,
-    val_size: float = 0.0,
-) -> str:
-    fixture_path = os.environ.get(
-        "BROKER_TRAIN_FIXTURE",
-        "/provider-data/broker_train.csv",
-    )
-    return json.dumps(
+    wheel_name = os.environ["BROKER_PROVIDER_WHEEL_NAME"]
+    core_root = os.environ["BROKER_PROJECT_ROOT"]
+    return RedisBrokerConfig.model_validate(
         {
-            "protocol_version": "2.0",
-            "task_type": "TRAINING",
-            "job_id": job_id,
-            "training_config": {
-                "data": {
-                    "type": "csv",
-                    "format": "csv",
-                    "path": fixture_path,
-                    "label_col": "label",
-                    "feature_columns": ["x1", "x2"],
-                },
-                "model": {"objective": "binary:logistic", "max_depth": 2},
+            "broker_id": "tributo-redis",
+            "api_version": 1,
+            "transport": {
+                "mode": "standalone",
+                "url": os.environ.get("BROKER_REDIS_URL", "redis://127.0.0.1:16379/0"),
+                "driver_url": os.environ.get(
+                    "BROKER_REDIS_DRIVER_URL",
+                    "redis://host.docker.internal:16379/0",
+                ),
+                "block_ms": 100,
+                "claim_idle_ms": 0,
+            },
+            "channels": {
                 "training": {
-                    "num_rounds": num_rounds,
-                    "val_size": val_size,
-                    "test_size": 0.0,
+                    "task_stream_key": f"it:training:tasks:{suffix}",
+                    "event_stream_prefix": f"it:training:events:{suffix}",
+                    "cancel_key_prefix": f"it:training:cancel:{suffix}",
+                    "consumer_group": f"it:training:group:{suffix}",
+                    "consumer_name": f"it-training-{suffix}",
+                    "group_start_id": "0-0",
+                    "outer_identity_field": "request_id",
                 },
-                "ray": {"num_workers": 1, "storage_path": "/tmp/ray_results"},
-                "output": {"onnx_path": "/tmp/tributo-broker-it.onnx"},
+                "batch_inference": {
+                    "task_stream_key": f"it:inference:tasks:{suffix}",
+                    "event_stream_prefix": f"it:inference:events:{suffix}",
+                    "cancel_key_prefix": f"it:inference:cancel:{suffix}",
+                    "consumer_group": f"it:inference:group:{suffix}",
+                    "consumer_name": f"it-inference-{suffix}",
+                    "group_start_id": "0-0",
+                },
             },
-        },
-        separators=(",", ":"),
+            "protocol": {
+                "profile": "tributo-generic-v1",
+                "protocol_version": "1.0",
+            },
+            "operations": {
+                "training": {"execution_profiles": ["single_worker", "distributed"]},
+                "batch_inference": {
+                    "execution_profiles": ["single_worker", "distributed"]
+                },
+            },
+            "execution": {
+                "ray_dashboard_url": os.environ.get(
+                    "BROKER_RAY_DASHBOARD_URL", "http://127.0.0.1:18265"
+                ),
+                "project_root": core_root,
+                "runtime_pip_packages": [f"/provider/{wheel_name}"],
+                "cancel_poll_interval_seconds": 0.25,
+                "entrypoint_num_cpus": 1,
+            },
+        }
     )
 
 
-def _canonical_task_payload(job_id: str) -> str:
-    """Build a canonical KnoVa v2 request without ``training_config``."""
-    fixture_path = os.environ.get(
-        "BROKER_TRAIN_FIXTURE",
-        "/provider-data/broker_train.csv",
-    )
+@pytest.fixture(scope="module")
+def runtime(
+    provider_config: RedisBrokerConfig,
+    redis_client: redis.Redis,
+) -> Iterator[RedisBrokerRuntime]:
+    value = RedisBrokerRuntime(provider_config, redis_client=redis_client)
+    value.start()
+    yield value
+    value.close()
+
+
+@pytest.fixture(scope="module")
+def inference_input() -> str:
+    host_root = Path(os.environ["BROKER_RAY_STORAGE_DIR"])
+    table = pacsv.read_csv(Path(__file__).parent / "fixtures" / "broker_train.csv")
+    features = pa.table({"x1": table["x1"], "x2": table["x2"]})
+    host_path = host_root / "inference-input.parquet"
+    pq.write_table(features, host_path)
+    return "/tmp/ray_results/inference-input.parquet"
+
+
+def _events(
+    client: redis.Redis,
+    config: RedisBrokerConfig,
+    operation_type: str,
+    operation_id: str,
+) -> list[dict[str, Any]]:
+    channel = config.channels.for_operation(cast(OperationType, operation_type))
+    values: list[dict[str, Any]] = []
+    for _event_id, fields in client.xrange(channel.event_stream_key(operation_id)):
+        assert fields[channel.outer_identity_field] == operation_id
+        values.append(json.loads(fields["payload"]))
+    return values
+
+
+def _request(
+    operation_id: str,
+    operation_type: str,
+    execution_profile: str,
+    spec: dict[str, Any],
+) -> str:
     return json.dumps(
         {
-            "protocol_version": "2.0",
-            "job_id": job_id,
-            "model_id": "it-model",
-            "version_id": "v1",
-            "tenant_id": "it-tenant",
-            "algorithm": {
-                "category": "CLASSIFICATION",
-                "algorithm_key": "xgboost",
-                "hyper_params": {
-                    "max_depth": 2,
-                    "learning_rate": 0.2,
-                    "n_estimators": 2,
-                    "num_workers": 1,
-                },
-            },
-            "datasource": {
-                "type": "LOCAL",
-                "properties": {"path": fixture_path, "format": "csv"},
-            },
-            "features": [
-                {"feature_id": "feature-x1", "result_column": "x1"},
-                {"feature_id": "feature-x2", "result_column": "x2"},
-            ],
-            "target": {
-                "result_column": "label",
-                "task_type": "BINARY_CLASSIFICATION",
-                "label_mapping": {"negative": 0, "positive": 1},
-            },
-            "data_split": {
-                "train_ratio": 0.5,
-                "validation_ratio": 0.5,
-                "test_ratio": 0.0,
-                "random_seed": 42,
-            },
-            "resource_limits": {"early_stopping_patience": 2},
-            "storage_context": {
-                "type": "local",
-                "prefix": f"/tmp/ray_results/canonical/{job_id}/",
-            },
-            "extensions": {},
+            "protocol_profile": "tributo-generic-v1",
+            "protocol_version": "1.0",
+            "operation_id": operation_id,
+            "operation_type": operation_type,
+            "execution_profile": execution_profile,
+            "run_id": f"run-{operation_id}",
+            "attempt_id": "attempt-1",
+            "request_digest": hashlib.sha256(operation_id.encode("utf-8")).hexdigest(),
+            "spec": spec,
         },
         separators=(",", ":"),
     )
 
 
-def _run_one(plugin: RedisBrokerPlugin, config: RedisBrokerConfig) -> BrokerRunner:
-    runner = BrokerRunner(plugin, config, poll_timeout_ms=100)
-    assert runner.run_once() is True
-    return runner
-
-
-def _unused_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def _wait_for_ray_job(
-    dashboard_url: str,
-    job_id: str,
-    *,
-    timeout: float = 240,
-) -> JobStatus:
-    client = JobSubmissionClient(dashboard_url)
-    deadline = time.monotonic() + timeout
-    status = JobStatus.PENDING
+def _admit(
+    runtime: RedisBrokerRuntime,
+    client: redis.Redis,
+    config: RedisBrokerConfig,
+    operation_type: str,
+    operation_id: str,
+    payload: str,
+) -> dict[str, Any]:
+    channel = config.channels.for_operation(cast(OperationType, operation_type))
+    client.xadd(
+        channel.task_stream_key,
+        {channel.outer_identity_field: operation_id, "payload": payload},
+    )
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        status = client.get_job_status(job_id)
-        if status in {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.STOPPED}:
-            return status
-        time.sleep(2)
-    return status
-
-
-def test_real_provider_unavailability_enters_reconnect_without_raising(
-    provider_config: RedisBrokerConfig,
-) -> None:
-    """A real provider connection failure is contained by the Core runner."""
-    unused_port = _unused_local_port()
-    config = provider_config.model_copy(
-        update={"url": f"redis://127.0.0.1:{unused_port}"}
-    )
-    runner = BrokerRunner(
-        RedisBrokerPlugin(),
-        config,
-        poll_timeout_ms=0,
-        backoff_initial=0.001,
-        backoff_max=0.001,
-        sleep=lambda _delay: None,
-    )
-    assert runner.run_once() is False
-    assert runner.state == BrokerRunnerState.RECONNECTING
-    runner.close()
-
-
-def test_real_consumer_failure_after_start_enters_reconnect(
-    provider_config: RedisBrokerConfig,
-) -> None:
-    """A real Redis operation failure after startup is isolated by Runner."""
-    runner = BrokerRunner(
-        RedisBrokerPlugin(),
-        provider_config,
-        poll_timeout_ms=0,
-        backoff_initial=0.001,
-        backoff_max=0.001,
-        sleep=lambda _delay: None,
-    )
-    runner.start()
-    assert runner.runtime is not None
-    runner.runtime.consumer._redis = redis.Redis.from_url(
-        f"redis://127.0.0.1:{_unused_local_port()}",
-        decode_responses=True,
-    )
-    assert runner.run_once() is False
-    assert runner.state == BrokerRunnerState.RECONNECTING
-    runner.close()
-
-
-def test_real_redis_invalid_message_failed_then_ack(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    plugin = RedisBrokerPlugin()
-    runner = BrokerRunner(plugin, provider_config, poll_timeout_ms=100)
-    redis_client.xadd(
-        provider_config.task_stream_key,
-        {"job_id": "invalid-job", "payload": "{not-json"},
-    )
-    assert runner.run_once() is True
-    assert (
-        redis_client.xpending(
-            provider_config.task_stream_key, provider_config.consumer_group
-        )["pending"]
-        == 0
-    )
-    events = _events(redis_client, provider_config.event_stream_key("invalid-job"))
-    assert events[-1]["event_type"] == "FAILED"
-    runner.close()
-
-
-def test_real_redis_missing_job_id_failed_then_ack(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    plugin = RedisBrokerPlugin()
-    runner = BrokerRunner(plugin, provider_config, poll_timeout_ms=100)
-    redis_client.xadd(
-        provider_config.task_stream_key,
-        {"payload": "{}"},
-    )
-    assert runner.run_once() is True
-    assert (
-        redis_client.xpending(
-            provider_config.task_stream_key,
-            provider_config.consumer_group,
-        )["pending"]
-        == 0
-    )
-    events = _events(redis_client, provider_config.invalid_event_stream_key)
-    assert events[-1]["event_type"] == "FAILED"
-    assert events[-1]["job_id"] is None
-    assert events[-1]["error_code"] == "INVALID_JOB_ID"
-    runner.close()
-
-
-def test_real_pre_submission_cancellation_is_acked_without_ray_submission(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    job_id = f"it-cancel-queued-{uuid.uuid4().hex}"
-    redis_client.set(provider_config.cancel_key(job_id), "1")
-    redis_client.xadd(
-        provider_config.task_stream_key,
-        {"job_id": job_id, "payload": _task_payload(job_id)},
-    )
-    runner = BrokerRunner(RedisBrokerPlugin(), provider_config, poll_timeout_ms=100)
-    try:
-        assert runner.run_once() is True
-        assert (
-            redis_client.xpending(
-                provider_config.task_stream_key,
-                provider_config.consumer_group,
-            )["pending"]
-            == 0
-        )
-        events = _events(redis_client, provider_config.event_stream_key(job_id))
-        assert events[-1]["event_type"] == "CANCELLED"
-        assert events[-1]["phase"] == "QUEUED"
-    finally:
-        redis_client.delete(provider_config.cancel_key(job_id))
-        runner.close()
-
-
-def test_real_redis_pending_message_is_recovered_after_consumer_restart(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    """A pending delivery is claimable by the replacement consumer."""
-    suffix = uuid.uuid4().hex
-    stream = f"{provider_config.task_stream_key}:recovery:{suffix}"
-    group = f"{provider_config.consumer_group}-recovery-{suffix}"
-    first_config = provider_config.model_copy(
-        update={
-            "task_stream_key": stream,
-            "consumer_group": group,
-            "consumer_name": f"first-{suffix}",
-            "claim_idle_ms": 0,
-        }
-    )
-    redis_client.xadd(stream, {"job_id": "recovery-job", "payload": "{}"})
-
-    first_client = redis.Redis.from_url(
-        os.environ.get("BROKER_REDIS_URL", "redis://127.0.0.1:16379"),
-        decode_responses=True,
-    )
-    second_client = redis.Redis.from_url(
-        os.environ.get("BROKER_REDIS_URL", "redis://127.0.0.1:16379"),
-        decode_responses=True,
-    )
-    try:
-        first = RedisTaskConsumer(first_client, first_config)
-        message = first.poll(100)
-        assert message is not None
-        assert message.job_id == "recovery-job"
-        assert redis_client.xpending(stream, group)["pending"] == 1
-        first.close()
-
-        second_config = first_config.model_copy(
-            update={"consumer_name": f"second-{suffix}"}
-        )
-        second = RedisTaskConsumer(second_client, second_config)
-        assert second.recover_pending() == 1
-        recovered = second.poll(100)
-        assert recovered is not None
-        assert recovered.job_id == "recovery-job"
-        second.ack(recovered)
-        assert redis_client.xpending(stream, group)["pending"] == 0
-        second.close()
-    finally:
-        first_client.close()
-        second_client.close()
-
-
-def test_real_ack_failure_leaves_pending_for_recovery(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    suffix = uuid.uuid4().hex
-    config = provider_config.model_copy(
-        update={
-            "task_stream_key": f"{provider_config.task_stream_key}:ack:{suffix}",
-            "consumer_group": f"{provider_config.consumer_group}-ack-{suffix}",
-            "consumer_name": f"ack-first-{suffix}",
-            "group_start_id": "0-0",
-            "claim_idle_ms": 0,
-        }
-    )
-    redis_client.xadd(config.task_stream_key, {"job_id": "ack-job", "payload": "{}"})
-    first = RedisTaskConsumer(redis_client, config)
-    message = first.poll(100)
-    assert message is not None
-    first._redis = redis.Redis.from_url(
-        f"redis://127.0.0.1:{_unused_local_port()}",
-        decode_responses=True,
-        socket_connect_timeout=0.1,
-    )
-    with pytest.raises(redis.RedisError):
-        first.ack(message)
-    assert (
-        redis_client.xpending(config.task_stream_key, config.consumer_group)["pending"]
-        == 1
-    )
-
-    second_config = config.model_copy(update={"consumer_name": f"ack-second-{suffix}"})
-    second = RedisTaskConsumer(redis_client, second_config)
-    try:
-        assert second.recover_pending() == 1
-        recovered = second.poll(100)
-        assert recovered is not None
-        second.ack(recovered)
-        assert (
-            redis_client.xpending(config.task_stream_key, config.consumer_group)[
-                "pending"
-            ]
-            == 0
-        )
-    finally:
-        first.close()
-        second.close()
-
-
-def test_real_redis_submission_ack_and_terminal_event(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    plugin = RedisBrokerPlugin()
-    job_id = f"it-training-{uuid.uuid4().hex}"
-    redis_client.xadd(
-        provider_config.task_stream_key,
-        {"job_id": job_id, "payload": _task_payload(job_id, val_size=0.5)},
-    )
-    runner = _run_one(plugin, provider_config)
-    assert (
-        redis_client.xpending(
-            provider_config.task_stream_key, provider_config.consumer_group
-        )["pending"]
-        == 0
-    )
-    event_stream = provider_config.event_stream_key(job_id)
-    deadline = time.monotonic() + 240
-    event_types: set[str] = set()
-    while time.monotonic() < deadline:
-        events = _events(redis_client, event_stream)
-        event_types = {event["event_type"] for event in events}
-        if "COMPLETED" in event_types or "FAILED" in event_types:
+        if runtime.run_once(timeout_ms=100):
             break
-        time.sleep(2)
-    assert {"PHASE", "LOG", "METRICS"}.issubset(event_types)
-    assert "COMPLETED" in event_types, json.dumps(events, ensure_ascii=False)
-    runner.close()
+    else:
+        pytest.fail(f"provider did not consume {operation_id}")
+    pending = client.xpending(channel.task_stream_key, channel.consumer_group)
+    assert pending["pending"] == 0
+    events = _events(client, config, operation_type, operation_id)
+    assert events and events[-1]["event_type"] in {"ACCEPTED", "CANCELLED", "FAILED"}
+    assert events[-1]["run_id"] == f"run-{operation_id}"
+    return events[-1]
 
 
-def test_real_canonical_v2_training_completes_with_bundle_and_identity(
+def _wait_terminal(
+    client: redis.Redis,
+    config: RedisBrokerConfig,
+    operation_type: str,
+    operation_id: str,
+    *,
+    timeout: float = 480,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        events = _events(client, config, operation_type, operation_id)
+        terminals = [
+            event for event in events if event["event_type"] in _TERMINAL_EVENTS
+        ]
+        if terminals:
+            return terminals[-1], events
+        time.sleep(1)
+    pytest.fail(f"operation {operation_id} did not publish a terminal event")
+
+
+def _training_spec(
+    operation_id: str,
+    num_workers: int,
+    *,
+    path: str | None = None,
+    rounds: int = 2,
+    credential_ref: str | None = None,
+) -> dict[str, Any]:
+    spec: dict[str, Any] = {
+        "algorithm": "xgboost",
+        "config": {
+            "data": {
+                "type": "csv",
+                "format": "csv",
+                "path": path or os.environ["BROKER_TRAIN_FIXTURE"],
+                "label_col": "label",
+                "feature_columns": ["x1", "x2"],
+            },
+            "model": {
+                "objective": "binary:logistic",
+                "max_depth": 2,
+                "eta": 0.3,
+            },
+            "training": {
+                "num_rounds": rounds,
+                "val_size": 0.0,
+                "test_size": 0.0,
+                "seed": 7,
+            },
+            "ray": {
+                "num_workers": num_workers,
+                "storage_path": f"/tmp/ray_results/{operation_id}/ray",
+                "max_failures": 0,
+            },
+            "output": {"bundle_uri": f"/tmp/ray_results/{operation_id}/bundles"},
+        },
+    }
+    if credential_ref is not None:
+        spec["credential_ref"] = credential_ref
+    return spec
+
+
+def _inference_spec(
+    operation_id: str,
+    bundle_uri: str,
+    input_uri: str,
+    concurrency: int,
+) -> dict[str, Any]:
+    return {
+        "profile": "bundle-backed",
+        "request": {
+            "schema_version": 1,
+            "model": {"kind": "bundle", "uri": bundle_uri},
+            "input": {
+                "source": {"type": "parquet", "path": input_uri},
+                "engine": "ray",
+            },
+            "input_binding": {
+                "tensors": [
+                    {
+                        "tensor_name": "float_input",
+                        "columns": ["x1", "x2"],
+                        "dtype": "float32",
+                    }
+                ]
+            },
+            "output_binding": {
+                "tensors": [
+                    {
+                        "tensor_name": "label",
+                        "column": "prediction",
+                        "semantic": "label",
+                        "squeeze_singleton": True,
+                    },
+                    {
+                        "tensor_name": "probabilities",
+                        "column": "score",
+                        "semantic": "probability",
+                    },
+                ]
+            },
+            "result_sink": {
+                "sink_id": "parquet-v1",
+                "uri": f"/tmp/ray_results/{operation_id}/output",
+            },
+            "execution": {
+                "executor_id": "ray-map-batches-v1",
+                "batch_size": 2,
+                "concurrency": concurrency,
+                "num_cpus_per_actor": 1.0,
+                "num_gpus_per_actor": 0.0,
+            },
+        },
+    }
+
+
+def test_four_real_healthy_paths_and_event_result_contracts(
+    runtime: RedisBrokerRuntime,
+    redis_client: redis.Redis,
+    provider_config: RedisBrokerConfig,
+    inference_input: str,
+) -> None:
+    bundle_uris: list[str] = []
+    for profile, workers in (("single_worker", 1), ("distributed", 2)):
+        operation_id = f"training-{profile}-{uuid.uuid4().hex}"
+        spec = _training_spec(
+            operation_id,
+            workers,
+            credential_ref=(
+                "env:TRIBUTO_TEST_SECRET" if profile == "single_worker" else None
+            ),
+        )
+        payload = _request(operation_id, "training", profile, spec)
+        accepted = _admit(
+            runtime,
+            redis_client,
+            provider_config,
+            "training",
+            operation_id,
+            payload,
+        )
+        terminal, events = _wait_terminal(
+            redis_client, provider_config, "training", operation_id
+        )
+        assert terminal["event_type"] == "COMPLETED", json.dumps(events, sort_keys=True)
+        assert terminal["submission_id"] == accepted["submission_id"]
+        assert terminal["payload"]["result"]["bundle_status"] == "succeeded"
+        job_client = JobSubmissionClient(provider_config.execution.ray_dashboard_url)
+        logs = job_client.get_job_logs(accepted["submission_id"])
+        assert {"PHASE", "LOG", "METRICS", "COMPLETED"}.issubset(
+            {event["event_type"] for event in events}
+        ), logs
+        bundle_uri = terminal["payload"]["result_reference"]["uri"]
+        assert bundle_uri
+        host_bundle_uri = Path(os.environ["BROKER_RAY_STORAGE_DIR"]) / Path(
+            bundle_uri
+        ).relative_to("/tmp/ray_results")
+        manifest = load_bundle(str(host_bundle_uri))
+        assert manifest["status"] == "succeeded"
+        assert manifest["artifacts"]
+        bundle_uris.append(bundle_uri)
+        if profile == "single_worker":
+            info = job_client.get_job_info(accepted["submission_id"])
+            evidence = payload + json.dumps(events) + logs + repr(info.metadata)
+            assert _SECRET not in evidence
+
+    for (profile, concurrency), bundle_uri in zip(
+        (("single_worker", 1), ("distributed", 2)),
+        bundle_uris,
+        strict=True,
+    ):
+        operation_id = f"inference-{profile}-{uuid.uuid4().hex}"
+        spec = _inference_spec(operation_id, bundle_uri, inference_input, concurrency)
+        accepted = _admit(
+            runtime,
+            redis_client,
+            provider_config,
+            "batch_inference",
+            operation_id,
+            _request(operation_id, "batch_inference", profile, spec),
+        )
+        terminal, events = _wait_terminal(
+            redis_client, provider_config, "batch_inference", operation_id
+        )
+        assert terminal["event_type"] == "COMPLETED", json.dumps(events, sort_keys=True)
+        assert terminal["submission_id"] == accepted["submission_id"]
+        receipt = terminal["payload"]["result_reference"]
+        assert receipt["sink_id"] == "parquet-v1"
+        assert receipt["uri"] == f"/tmp/ray_results/{operation_id}/output"
+        assert receipt["result_id"]
+        output_path = Path(os.environ["BROKER_RAY_STORAGE_DIR"], operation_id, "output")
+        assert output_path.exists()
+        output = pq.read_table(output_path)
+        assert output.num_rows > 0
+        assert {"prediction", "score"}.issubset(output.column_names)
+        assert {"PHASE", "PROGRESS", "COMPLETED"}.issubset(
+            {event["event_type"] for event in events}
+        )
+
+
+def test_representative_training_and_inference_failures(
+    runtime: RedisBrokerRuntime,
+    redis_client: redis.Redis,
+    provider_config: RedisBrokerConfig,
+    inference_input: str,
+) -> None:
+    training_id = f"training-failure-{uuid.uuid4().hex}"
+    accepted = _admit(
+        runtime,
+        redis_client,
+        provider_config,
+        "training",
+        training_id,
+        _request(
+            training_id,
+            "training",
+            "single_worker",
+            _training_spec(training_id, 1, path="/provider-data/missing.csv"),
+        ),
+    )
+    terminal, _ = _wait_terminal(redis_client, provider_config, "training", training_id)
+    assert accepted["event_type"] == "ACCEPTED"
+    assert terminal["event_type"] == "FAILED"
+    assert terminal["payload"]["error_code"] == "EXECUTION_FAILED"
+
+    inference_id = f"inference-failure-{uuid.uuid4().hex}"
+    _admit(
+        runtime,
+        redis_client,
+        provider_config,
+        "batch_inference",
+        inference_id,
+        _request(
+            inference_id,
+            "batch_inference",
+            "single_worker",
+            _inference_spec(
+                inference_id,
+                "/tmp/ray_results/missing-bundle",
+                inference_input,
+                1,
+            ),
+        ),
+    )
+    terminal, _ = _wait_terminal(
+        redis_client, provider_config, "batch_inference", inference_id
+    )
+    assert terminal["event_type"] == "FAILED"
+
+
+def test_queued_and_running_cancel_boundaries(
+    runtime: RedisBrokerRuntime,
     redis_client: redis.Redis,
     provider_config: RedisBrokerConfig,
 ) -> None:
-    """Canonical KnoVa v2 reaches a validated Bundle without private config."""
-    import numpy as np
-    import onnxruntime as ort
-
-    job_id = f"it-canonical-{uuid.uuid4().hex}"
-    redis_client.xadd(
-        provider_config.task_stream_key,
-        {"job_id": job_id, "payload": _canonical_task_payload(job_id)},
+    channel = provider_config.channels.training
+    queued_id = f"queued-cancel-{uuid.uuid4().hex}"
+    redis_client.set(channel.cancel_key(queued_id), "1")
+    queued = _admit(
+        runtime,
+        redis_client,
+        provider_config,
+        "training",
+        queued_id,
+        _request(
+            queued_id,
+            "training",
+            "single_worker",
+            _training_spec(queued_id, 1),
+        ),
     )
-    runner = _run_one(RedisBrokerPlugin(), provider_config)
-    try:
-        assert (
-            redis_client.xpending(
-                provider_config.task_stream_key,
-                provider_config.consumer_group,
-            )["pending"]
-            == 0
-        )
-        event_stream = provider_config.event_stream_key(job_id)
-        deadline = time.monotonic() + 240
-        events: list[dict[str, Any]] = []
-        while time.monotonic() < deadline:
-            events = _events(redis_client, event_stream)
-            event_types = {event["event_type"] for event in events}
-            if "COMPLETED" in event_types or "FAILED" in event_types:
-                break
-            time.sleep(2)
+    assert queued["event_type"] == "CANCELLED"
+    assert queued["submission_id"] is None
 
-        event_types = {event["event_type"] for event in events}
-        assert {"PHASE", "LOG", "METRICS", "COMPLETED"}.issubset(event_types), (
-            json.dumps(events, ensure_ascii=False)
-        )
-        assert "FAILED" not in event_types
-        completed = next(
-            event for event in reversed(events) if event["event_type"] == "COMPLETED"
-        )
-        assert completed["execution_id"]
-        assert completed["submission_id"]
-        assert completed["bundle_id"]
-        assert completed["manifest_uri"]
-
-        container_storage = Path("/tmp/ray_results")
-        manifest_uri = Path(completed["manifest_uri"])
-        host_storage = Path(os.environ["BROKER_RAY_STORAGE_DIR"])
-        host_manifest = host_storage / manifest_uri.relative_to(container_storage)
-        manifest = json.loads(host_manifest.read_text())
-        artifacts = {artifact["format"]: artifact for artifact in manifest["artifacts"]}
-        assert {"onnx", "ubj"}.issubset(artifacts)
-
-        onnx_artifact = artifacts["onnx"]
-        onnx_path = (
-            host_manifest.parent
-            / "artifacts"
-            / onnx_artifact["name"]
-            / onnx_artifact["entrypoint"]
-        )
-        ubj_artifact = artifacts["ubj"]
-        ubj_path = (
-            host_manifest.parent
-            / "artifacts"
-            / ubj_artifact["name"]
-            / ubj_artifact["entrypoint"]
-        )
-        assert onnx_path.is_file()
-        assert ubj_path.is_file()
-
-        session = ort.InferenceSession(
-            str(onnx_path),
-            providers=["CPUExecutionProvider"],
-        )
-        outputs = session.run(
-            None,
-            {session.get_inputs()[0].name: np.array([[0.1, 0.2]], dtype=np.float32)},
-        )
-        assert len(outputs) == 2
-        assert len(outputs[0]) == 1
-    finally:
-        runner.close()
-
-
-def test_real_duplicate_delivery_reconciles_same_ray_submission(
-    provider_config: RedisBrokerConfig,
-) -> None:
-    """A redelivered task reuses the accepted Ray submission identity."""
-    runtime = RedisBrokerPlugin().create_runtime(provider_config)
-    job_id = f"it-idempotent-{uuid.uuid4().hex}"
-    message = Message(
-        job_id,
-        {"raw": _task_payload(job_id)},
-        delivery_id="duplicate-delivery",
-        delivery_attempt=1,
+    running_id = f"running-cancel-{uuid.uuid4().hex}"
+    accepted = _admit(
+        runtime,
+        redis_client,
+        provider_config,
+        "training",
+        running_id,
+        _request(
+            running_id,
+            "training",
+            "single_worker",
+            _training_spec(running_id, 1, rounds=100000),
+        ),
     )
-    try:
-        first = runtime.handle(message)
-        second = runtime.handle(
-            Message(
-                job_id,
-                message.payload,
-                delivery_id=message.delivery_id,
-                delivery_attempt=2,
-            )
-        )
-        assert first.disposition == TaskDisposition.ACK
-        assert second.disposition == TaskDisposition.ACK
-        assert first.result is not None
-        assert second.result is not None
-        assert first.result.submission_id == second.result.submission_id
-        assert first.result.execution_id == second.result.execution_id
-    finally:
-        runtime.close()
-
-
-def test_real_training_survives_unavailable_worker_event_redis(
-    provider_config: RedisBrokerConfig,
-) -> None:
-    """Reporter loss in the Ray worker cannot turn training into failure."""
-    config = provider_config.model_copy(
-        update={"worker_url": f"redis://127.0.0.1:{_unused_local_port()}"}
+    assert accepted["event_type"] == "ACCEPTED"
+    redis_client.set(channel.cancel_key(running_id), "1")
+    terminal, events = _wait_terminal(
+        redis_client,
+        provider_config,
+        "training",
+        running_id,
+        timeout=240,
     )
-    runtime = RedisBrokerPlugin().create_runtime(config)
-    job_id = f"it-reporter-down-{uuid.uuid4().hex}"
-    try:
-        outcome = runtime.handle(
-            Message(job_id, {"raw": _task_payload(job_id, val_size=0.5)})
-        )
-        assert outcome.disposition == TaskDisposition.ACK
-        assert outcome.result is not None
-        assert outcome.result.execution_id is not None
-        assert (
-            _wait_for_ray_job(
-                provider_config.ray_dashboard_url,
-                outcome.result.execution_id,
-            )
-            == JobStatus.SUCCEEDED
-        )
-    finally:
-        runtime.close()
-
-
-def test_real_training_survives_redis_loss_during_execution(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    """Stopping Redis after submission does not fail the Ray training job."""
-    job_id = f"it-training-redis-loss-{uuid.uuid4().hex}"
-    runtime = RedisBrokerPlugin().create_runtime(provider_config)
-    try:
-        outcome = runtime.handle(
-            Message(job_id, {"raw": _task_payload(job_id, num_rounds=10000)})
-        )
-        assert outcome.disposition == TaskDisposition.ACK
-        assert outcome.result is not None
-        assert outcome.result.execution_id is not None
-        # Drop existing Redis client connections while the accepted Ray job
-        # is executing.  The issuing test connection is excluded; the worker
-        # reporter must tolerate the resulting connection failure and the
-        # computation must still reach SUCCEEDED.
-        redis_client.execute_command(
-            "CLIENT", "KILL", "TYPE", "normal", "SKIPME", "yes"
-        )
-        assert (
-            _wait_for_ray_job(
-                provider_config.ray_dashboard_url,
-                outcome.result.execution_id,
-                timeout=240,
-            )
-            == JobStatus.SUCCEEDED
-        )
-    finally:
-        runtime.close()
-
-
-def test_real_training_cancellation_reports_cancelled(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-) -> None:
-    job_id = f"it-cancel-training-{uuid.uuid4().hex}"
-    runner = BrokerRunner(
-        RedisBrokerPlugin(),
-        provider_config.model_copy(update={"claim_idle_ms": 0}),
-        poll_timeout_ms=100,
-    )
-    assert runner.run_once() is False
-    redis_client.xadd(
-        provider_config.task_stream_key,
-        {"job_id": job_id, "payload": _task_payload(job_id, num_rounds=10000)},
-    )
-    try:
-        assert runner.run_once() is True
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline:
-            events = _events(redis_client, provider_config.event_stream_key(job_id))
-            if any(event.get("phase") == "TRAINING" for event in events):
-                break
-            time.sleep(0.5)
-        redis_client.set(provider_config.cancel_key(job_id), "1")
-        deadline = time.monotonic() + 240
-        event_types: set[str] = set()
-        while time.monotonic() < deadline:
-            events = _events(redis_client, provider_config.event_stream_key(job_id))
-            event_types = {event["event_type"] for event in events}
-            if "CANCELLED" in event_types or "COMPLETED" in event_types:
-                break
-            time.sleep(2)
-        assert "CANCELLED" in event_types, json.dumps(events, ensure_ascii=False)
-    finally:
-        runner.close()
-
-
-def test_worker_checker_reconstructs_from_spec_and_observes_cancel(
-    redis_client: redis.Redis,
-    provider_config: RedisBrokerConfig,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("TRIBUTO_BROKER_CONFIG_JSON", provider_config.model_dump_json())
-    checker = RedisBrokerPlugin().create_cancellation_checker(
-        CancellationSpec(
-            broker_id="knova-redis",
-            job_id="cancel-job",
-            options={"config_env": "TRIBUTO_BROKER_CONFIG_JSON"},
-        )
-    )
-    assert checker.is_cancelled("cancel-job") is False
-    assert checker.is_cancelled("other-job") is False
-    redis_client.set(provider_config.cancel_key("cancel-job"), "1")
-    assert checker.is_cancelled("cancel-job") is True
+    assert terminal["event_type"] == "CANCELLED", events
+    status = JobSubmissionClient(
+        provider_config.execution.ray_dashboard_url
+    ).get_job_status(accepted["submission_id"])
+    assert status == JobStatus.STOPPED

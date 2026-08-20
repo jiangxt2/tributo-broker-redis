@@ -1,132 +1,151 @@
-# tributo-broker-redis
+# Tributo Redis Streams provider
 
-`tributo-broker-redis` is an optional Tributo Broker API v1 provider for the
-KnoVa Redis Streams control plane. It consumes training-task envelopes,
-submits Tributo Ray Jobs, publishes lifecycle events, and checks cooperative
-cancellation keys.
+`tributo-broker-redis` is an independently installed Redis Streams provider
+for Tributo Broker API v1. The v0.1 Alpha supports a public
+`tributo-generic-v1` protocol and delegates execution to Tributo public APIs.
+Redis remains outside Tributo Core.
 
-Redis Streams is used here as a control-plane transport. This package is not a
-Tributo `StreamSource`, does not read training data from Redis, and is not a
-streaming-inference input.
+The release gate covers these healthy paths:
 
-## Install
+- XGBoost training with `single_worker` and `distributed` profiles;
+- Bundle-backed batch inference with `single_worker` and `distributed` profiles;
+- Standalone Redis, Redis consumer groups, one provider execution-driver Ray
+  Job, Bundle or ResultSink output, and best-effort terminal events;
+- queued cancellation and running cancellation through Ray Jobs stop.
 
-Install Tributo Core and this provider into the process that runs the broker
-consumer. The same provider wheel must be available to the Ray Job runtime
-when the job entrypoint or worker-side cancellation checker is used.
+Unknown protocol fields and unsupported algorithms or profiles fail closed.
+This release does not promise cross-restart exactly-once behavior, durable
+events, complete pending recovery, DLQ processing, Sentinel, Cluster, or HA.
+
+## Installation
+
+Install Tributo Core 1.0.0 containing the public Ray Jobs runtime-env extension
+contract and this package:
 
 ```bash
-pip install 'tributo>=1.0,<2.0' tributo-broker-redis
-tributo broker list
+pip install /path/to/validated/tributo-1.0.0-py3-none-any.whl \
+  tributo-broker-redis
 ```
 
-The provider is discovered through the `tributo.brokers` entry-point group.
-Tributo Core does not import Redis or this package during normal startup.
+The provider dependency range remains `tributo>=1.0,<2.0`, but v0.1 deployment
+must select a Core 1.0.0 build containing the runtime-env extension. The
+package registers the `tributo-redis` entry point in `tributo.brokers`.
+Compatibility is verified against the pinned Core baseline by static typing,
+the wheel contract, and the Redis/Ray integration matrix. Configuration
+validation checks the Core project root and configured extension paths before
+any Redis delivery can be consumed.
 
 ## Configuration
 
-`--config` accepts JSON only. Core passes the object through unchanged; this
-provider validates all fields.
+The provider accepts one closed root shape. Training and batch inference must
+have separate task, event, cancel, and consumer-group names. See
+[`docs/config.example.json`](docs/config.example.json) for a complete example.
+
+Redis URLs cannot contain credentials. `execution.env_vars` is only for
+non-sensitive settings. A task may carry `credential_ref`; the Ray driver
+resolves `env:NAME` or `mount:/absolute/path` from its pre-provisioned runtime.
+The resolved value is never copied into request-derived Ray runtime env,
+metadata, logs, events, Bundle manifests, or result receipts.
+
+`execution.extra_py_modules` and `execution.runtime_pip_packages` are trusted
+deployment settings and cannot be supplied by task payloads. Extension modules
+accept deployment-visible local paths or credential-free remote wheel/zip
+URIs. Runtime pip entries accept PEP 508 requirements or deployment-visible
+wheel paths; direct URLs and pip command options are rejected. A Core source
+root containing `src/tributo` or `tributo` is required by
+`execution.project_root`, and at least one driver distribution setting must be
+non-empty. This is an explicit Alpha deployment contract, not task metadata.
+
+Each channel may set `outer_identity_field` to a generic Redis field name. It
+defaults to `operation_id`; the selected field is used by both task and event
+entries while JSON payloads retain the canonical `operation_id` property.
+
+## Runtime
+
+Copy the example and replace its deployment paths before validation. Validate
+without connecting:
+
+```bash
+tributo-broker-redis validate --config /path/to/redis-provider.json
+```
+
+Validate connectivity explicitly:
+
+```bash
+tributo-broker-redis validate --config /path/to/redis-provider.json --check-connectivity
+```
+
+Run the provider-owned consume loop:
+
+```bash
+tributo-broker-redis consume --config /path/to/redis-provider.json
+```
+
+Core provides discovery and validation through `tributo broker list` and
+`tributo broker validate`; Core does not own the production consume loop.
+
+## Wire protocol
+
+Each task Stream entry contains exactly the outer business identity and JSON
+payload:
+
+```text
+operation_id = operation-123
+payload      = {"protocol_profile":"tributo-generic-v1", ...}
+```
+
+The payload identity must equal the outer `operation_id`. Training and batch
+inference are sent to their configured independent Streams. The common payload
+fields are:
 
 ```json
 {
-  "mode": "standalone",
-  "url": "redis://redis.example:6379",
-  "password_env": "KNOVA_REDIS_PASSWORD",
-  "worker_password_env": "KNOVA_REDIS_PASSWORD",
-  "task_stream_key": "knova:training:tasks",
-  "event_stream_prefix": "knova:training:events",
-  "invalid_event_stream_key": "knova:training:events:invalid",
-  "consumer_group": "tributo",
-  "group_start_id": "$",
-  "claim_idle_ms": 60000,
-  "claim_count": 10,
-  "max_payload_bytes": 1048576,
-  "max_event_bytes": 1048576,
-  "ray_dashboard_url": "http://ray-head:8265",
-  "runtime_pip_packages": ["/provider/tributo_broker_redis-<version>-py3-none-any.whl"]
+  "protocol_profile": "tributo-generic-v1",
+  "protocol_version": "1.0",
+  "operation_id": "operation-123",
+  "operation_type": "training",
+  "execution_profile": "single_worker",
+  "run_id": "run-123",
+  "attempt_id": "attempt-1",
+  "request_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "spec": {}
 }
 ```
 
-Replace `<version>` with the actual Provider wheel version; IT scripts discover
-the built filename dynamically.
+Training `spec` uses `algorithm: "xgboost"` and a validated Tributo XGBoost
+`config` whose output is `bundle_uri`. Batch inference uses
+`profile: "bundle-backed"` and a strict Tributo `InferenceRequest` under
+`request`.
 
-Do not put a Redis password in JSON, a URL, a task payload, or a log line.
-Use `password_env` and, when the Ray worker uses a different environment,
-`worker_password_env`. In Cluster mode set `db` to `0`; logical Redis
-databases are not supported by Redis Cluster.
+After deterministic Ray admission the provider publishes `ACCEPTED` and ACKs
+the Redis delivery. The single Ray execution driver publishes `PHASE`, `LOG`,
+`METRICS` or `PROGRESS`, then `COMPLETED` or `FAILED`. Every admitted event
+contains `submission_id`; `ray_job_id` remains optional execution metadata.
+Nonterminal events are best-effort and cannot change a successful workload into
+an execution failure. Ray state and Bundle or ResultSink receipts remain the
+result facts. An optional `request_digest` must be a lower-case SHA-256 digest.
 
-The default `consumer_name` is generated from host, process, and a random
-suffix. Set it explicitly only when a stable Redis consumer identity is
-required for an operational reason.
+See [`docs/operations.md`](docs/operations.md) and
+[`docs/generic-redis-stream-protocol-integration-test.md`](docs/generic-redis-stream-protocol-integration-test.md).
 
-## Commands
+## Development validation
+
+Unit and static checks do not require Redis or Docker. Build the attested Core
+runtime image once with the Core-owned builder:
 
 ```bash
-tributo broker validate --broker knova-redis --config broker.json
-tributo broker validate --broker knova-redis --config broker.json --check-connectivity
-tributo broker consume --broker knova-redis --config broker.json
+cd /path/to/tributo-core
+uv run --locked --no-sync python tools/build_tributo_image.py \
+  --config tools/tributo-runtime-full.json \
+  --output-dir dist/tributo-runtime-full
 ```
 
-Discovery is fail-open for ordinary `tributo` commands. An explicitly selected
-missing, filtered, or invalid provider fails closed. Redis connection failure
-is logged and contained by the Core BrokerRunner; task processing resumes via
-bounded reconnect and Redis pending recovery.
-
-## Delivery semantics
-
-- Consumer Groups provide at-least-once task delivery.
-- A valid task is acknowledged after the Ray Job submission is accepted.
-- A temporary submission or transport failure leaves the message pending.
-- Pending messages are reclaimed with `XAUTOCLAIM`; its cursor is retained and
-  advanced between recovery rounds.
-- Delivery retries reuse business `run_id` and `attempt-1`, so deterministic
-  Ray submission reconciliation prevents a second Job for the same execution.
-- Invalid payloads are reported as `FAILED` on a best-effort basis and then
-  acknowledged. Missing outer `job_id` messages use the invalid-event stream
-  and never receive a sentinel identity.
-- Training metrics history is replayed after training. Real-time metric sinks
-  are outside provider v1.
-
-## Topology support
-
-The provider supports standalone Redis, Sentinel master discovery, and Redis
-Cluster. Redis keys must use compatible naming and hash-tagging conventions in
-Cluster deployments when a deployment requires multi-key atomic operations;
-the provider itself uses independent task, event, and cancellation commands.
-When Sentinel announces a master address behind NAT or a container bridge, set
-`sentinel_address_map` to map each advertised `host:port` to a client-reachable
-address. The optional `sentinel_force_master_ip` setting is supported by the
-redis-py range declared by this package. When Redis Cluster
-announces internal node hosts, set `cluster_address_remap_host` to map them to
-the client-reachable host while preserving their announced ports.
-Sentinel and Cluster connectivity must be validated in the provider IT suite,
-not inferred from client construction alone.
-
-## Development
-
-Run the fast provider checks with Tributo Core available on `PYTHONPATH` or
-installed in the environment:
+The final integration entry point builds both wheels, validates that image's
+Tributo/Ray/manifest labels, and runs one isolated Standalone Redis plus Docker
+Ray matrix:
 
 ```bash
-PYTHONPATH=/path/to/Tributo/src:$PWD/src \
-  python -m pytest -q tests/unit
-ruff format --check .
-ruff check .
-mypy src tests/unit
-uv build
-```
-
-Local checks must resolve the declared `redis>=6,<8` dependency range; do not
-reuse an environment that has redis-py 8.x installed.
-
-The real Redis/Ray suite is intentionally separate because it starts a unique
-Docker Compose project and requires a Ray cluster:
-
-```bash
+TRIBUTO_CORE_ROOT=/path/to/tributo-core \
+BROKER_RAY_IMAGE=tributo-runtime-full:local \
 ./scripts/run_it.sh
 ```
-
-The IT script builds the wheel, uses an isolated test environment, and
-ensures the test process and Ray workers import the installed wheel rather
-than the provider source tree.

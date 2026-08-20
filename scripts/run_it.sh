@@ -9,12 +9,16 @@ compose_file="$repo_root/tests/integrations/docker-compose.yml"
 wheel_dir=$(mktemp -d /tmp/tributo-broker-redis-wheel.XXXXXX)
 ray_storage_dir=$(mktemp -d /tmp/tributo-broker-ray-results.XXXXXX)
 venv_dir=$(mktemp -d /tmp/tributo-broker-redis-venv.XXXXXX)
+core_only_venv_dir=$(mktemp -d /tmp/tributo-core-only-venv.XXXXXX)
 core_wheel_dir=""
+ray_image=${BROKER_RAY_IMAGE:-tributo-runtime-full:local}
 chmod 777 "$ray_storage_dir"
 project_started=0
 
 cleanup() {
   if [ "$project_started" -eq 1 ]; then
+    docker compose --project-name "$project_name" --file "$compose_file" logs --no-color \
+      >"$repo_root/tests/integration/.runtime/docker.log" 2>&1 || true
     docker compose --project-name "$project_name" --file "$compose_file" down --volumes --remove-orphans
   fi
   if [ -d "$wheel_dir" ]; then
@@ -25,6 +29,9 @@ cleanup() {
   fi
   if [ -d "$venv_dir" ]; then
     mv "$venv_dir" "/tmp/tributo-broker-redis-venv-complete-$$" 2>/dev/null || true
+  fi
+  if [ -d "$core_only_venv_dir" ]; then
+    mv "$core_only_venv_dir" "/tmp/tributo-core-only-venv-complete-$$" 2>/dev/null || true
   fi
   if [ -n "$core_wheel_dir" ] && [ -d "$core_wheel_dir" ]; then
     mv "$core_wheel_dir" "/tmp/tributo-core-wheel-complete-$$" 2>/dev/null || true
@@ -51,7 +58,51 @@ uv venv "$venv_dir"
 python_bin="$venv_dir/bin/python"
 uv pip install --python "$python_bin" "$core_wheel" "$wheel_path" pytest
 
-wheel_discovery_log="$repo_root/tests/integration/.runtime/wheel-discovery.log"
+uv venv "$core_only_venv_dir"
+core_only_python="$core_only_venv_dir/bin/python"
+uv pip install --python "$core_only_python" "$core_wheel"
+"$core_only_python" -c "import importlib.util; import tributo; assert importlib.util.find_spec('redis') is None"
+
+ray_image_id=$(docker image inspect --format '{{.Id}}' "$ray_image")
+ray_image_title=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.title"}}' "$ray_image")
+ray_image_version=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$ray_image")
+ray_image_ray_version=$(docker image inspect --format '{{index .Config.Labels "org.tributo.ray-version"}}' "$ray_image")
+ray_image_manifest=$(docker image inspect --format '{{index .Config.Labels "org.tributo.manifest-sha256"}}' "$ray_image")
+core_version=$("$python_bin" -c 'from importlib.metadata import version; print(version("tributo"))')
+if [ "$ray_image_title" != "tributo-runtime-full" ]; then
+  echo "BROKER_RAY_IMAGE must be built by the Tributo full runtime builder" >&2
+  exit 2
+fi
+if [ "$ray_image_version" != "$core_version" ]; then
+  echo "Ray image Tributo version does not match the tested Core wheel" >&2
+  exit 2
+fi
+if [ "$ray_image_ray_version" != "2.55.1" ]; then
+  echo "Ray image must attest Ray 2.55.1" >&2
+  exit 2
+fi
+if [ "${#ray_image_manifest}" -ne 64 ]; then
+  echo "Ray image is missing a valid Tributo manifest attestation" >&2
+  exit 2
+fi
+case "$ray_image_manifest" in
+  *[!0-9a-f]*)
+    echo "Ray image has an invalid Tributo manifest attestation" >&2
+    exit 2
+    ;;
+esac
+export BROKER_RAY_IMAGE="$ray_image"
+runtime_log_dir="$repo_root/tests/integration/.runtime"
+mkdir -p "$runtime_log_dir"
+printf '%s\n' \
+  "image=$ray_image" \
+  "image_id=$ray_image_id" \
+  "tributo_version=$ray_image_version" \
+  "ray_version=$ray_image_ray_version" \
+  "manifest_sha256=$ray_image_manifest" \
+  >"$runtime_log_dir/ray-image.log"
+
+wheel_discovery_log="$runtime_log_dir/wheel-discovery.log"
 mkdir -p "$(dirname "$wheel_discovery_log")"
 wheel_test_status=0
 "$python_bin" -m pytest -p no:cacheprovider -q \

@@ -1,170 +1,187 @@
-"""KnoVa training control-plane protocol models."""
+"""Closed ``tributo-generic-v1`` request and driver contracts."""
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import re
+from typing import Annotated, Any, Literal
+from urllib.parse import parse_qsl, urlsplit
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-PROTOCOL_VERSION = "2.0"
+from tributo_broker_redis.config import ExecutionProfile, OperationType
 
-
-def check_protocol_version(value: dict[str, Any]) -> str | None:
-    """Return a validation message when the protocol major is unsupported."""
-    raw = value.get("protocol_version", "")
-    if not isinstance(raw, str) or not raw:
-        return "Missing protocol_version"
-    if raw.split(".", 1)[0] != PROTOCOL_VERSION.split(".", 1)[0]:
-        return (
-            f"Unsupported protocol version: {raw!r} "
-            f"(expected major version {PROTOCOL_VERSION.split('.', 1)[0]})"
-        )
-    return None
+PROTOCOL_PROFILE = "tributo-generic-v1"
+PROTOCOL_VERSION = "1.0"
+CredentialReference = Annotated[
+    str,
+    Field(pattern=r"^(?:env:[A-Za-z_][A-Za-z0-9_]*|mount:/[^\x00\r\n]+)$"),
+]
 
 
-def is_training_task(value: dict[str, Any]) -> bool:
-    """Return whether a request is in the v1 training scope."""
-    task_type = value.get("task_type", value.get("job_type", "TRAINING"))
-    return isinstance(task_type, str) and task_type.upper() in {
-        "TRAINING",
-        "TRAIN",
-        "MODEL_TRAINING",
-    }
+class _StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
-class ProtocolModel(BaseModel):
-    """Forward-compatible base for KnoVa protocol value objects."""
+class GenericRequest(_StrictModel):
+    """Provider-owned public request common to training and inference."""
 
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
+    protocol_profile: Literal["tributo-generic-v1"]
+    protocol_version: Literal["1.0"]
+    operation_id: str = Field(min_length=1, max_length=256)
+    operation_type: OperationType
+    execution_profile: ExecutionProfile
+    run_id: str | None = Field(default=None, min_length=1, max_length=256)
+    attempt_id: str = Field(default="attempt-1", min_length=1, max_length=128)
+    request_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    spec: dict[str, Any]
 
-
-class AlgorithmConfig(ProtocolModel):
-    """KnoVa algorithm selection and engine-neutral hyperparameters."""
-
-    category: str = "CLASSIFICATION"
-    algorithm_key: str = "xgboost"
-    hyper_params: dict[str, Any] = Field(default_factory=dict)
-
-
-class DataSourceConfig(ProtocolModel):
-    """KnoVa data-source connection and provider properties."""
-
-    type: str = "CLICKHOUSE"  # noqa: A003
-    datasource_id: str | None = None
-    host: str = ""
-    port: int = 9000
-    database_name: str = ""
-    username: str | None = None
-    password: str | None = None
-    credential_ref: str | None = None
-    connection_string: str | None = None
-    properties: dict[str, Any] = Field(default_factory=dict)
-
-
-class SqlTemplate(ProtocolModel):
-    """Parameterized SQL query from the canonical request."""
-
-    sql: str = ""
-    params: dict[str, Any] = Field(default_factory=dict)
-
-
-class DataQueryConfig(ProtocolModel):
-    """Canonical training data-query plan."""
-
-    mode: str = "DIRECT_QUERY"
-    query: SqlTemplate | None = None
-
-
-class FeatureSpec(ProtocolModel):
-    """Canonical model feature, including legacy field aliases."""
-
-    result_column: str = Field(
-        ...,
-        min_length=1,
-        validation_alias=AliasChoices("result_column", "physical_field"),
-    )
-    feature_id: str = ""
-
-
-class TargetSpec(ProtocolModel):
-    """Canonical prediction target, including legacy field aliases."""
-
-    result_column: str = Field(
-        ...,
-        min_length=1,
-        validation_alias=AliasChoices("result_column", "physical_field"),
-    )
-    task_type: str = "BINARY_CLASSIFICATION"
-    label_mapping: dict[str, int] | None = None
-
-
-class DataSplitConfig(ProtocolModel):
-    """Canonical train/validation/test split."""
-
-    train_ratio: float = Field(default=0.7, gt=0.0, le=1.0)
-    validation_ratio: float = Field(default=0.0, ge=0.0, lt=1.0)
-    test_ratio: float = Field(default=0.3, ge=0.0, lt=1.0)
-    random_seed: int | None = None
-
-
-class ResourceLimits(ProtocolModel):
-    """Canonical training-control limits used by the XGBoost adapter."""
-
-    early_stopping_patience: int | None = Field(default=20, ge=1)
-
-
-class StorageContext(ProtocolModel):
-    """Canonical Bundle storage destination."""
-
-    type: str = "s3"  # noqa: A003
-    bucket: str = ""
-    prefix: str = ""
-
-    @field_validator("prefix")
+    @field_validator("operation_id", "run_id", "attempt_id")
     @classmethod
-    def prefix_must_end_with_slash(cls, value: str) -> str:
-        if value and not value.endswith("/"):
-            raise ValueError("storage_context.prefix must end with '/'")
+    def _trimmed_identity(cls, value: str | None) -> str | None:
+        if value is not None and value != value.strip():
+            raise ValueError("identity values must not have surrounding whitespace")
         return value
 
 
-class TrainingJobRequest(ProtocolModel):
-    """KnoVa v2 request with an optional legacy Tributo config override."""
-
-    protocol_version: str = PROTOCOL_VERSION
-    job_id: str = Field(..., min_length=1)
-    model_id: str = ""
-    version_id: str = ""
-    tenant_id: str = ""
-    algorithm: AlgorithmConfig = Field(default_factory=AlgorithmConfig)
-    datasource: DataSourceConfig = Field(default_factory=DataSourceConfig)
-    data_query: DataQueryConfig | None = None
-    features: list[FeatureSpec] = Field(default_factory=list)
-    target: TargetSpec | None = None
-    data_split: DataSplitConfig = Field(default_factory=DataSplitConfig)
-    resource_limits: ResourceLimits = Field(default_factory=ResourceLimits)
-    storage_context: StorageContext | None = None
-    training_config: dict[str, Any] | None = None
-
-    def resolve_training_config(self) -> dict[str, Any]:
-        """Resolve the legacy override or derive config from canonical fields."""
-        from tributo_broker_redis.training_mapping import resolve_training_config
-
-        return resolve_training_config(self)
+class TrainingSpec(_StrictModel):
+    algorithm: Literal["xgboost"]
+    config: dict[str, Any]
+    credential_ref: CredentialReference | None = None
 
 
-def event_payload(
+class BatchInferenceSpec(_StrictModel):
+    profile: Literal["bundle-backed"] = "bundle-backed"
+    request: dict[str, Any]
+    credential_ref: CredentialReference | None = None
+
+
+class DriverInput(_StrictModel):
+    """Credential-free input transported to the single provider Ray driver."""
+
+    protocol_profile: Literal["tributo-generic-v1"] = "tributo-generic-v1"
+    protocol_version: Literal["1.0"] = "1.0"
+    operation_id: str
+    operation_type: OperationType
+    execution_profile: ExecutionProfile
+    run_id: str
+    attempt_id: str
+    ray_job_id: str | None = None
+    credential_ref: CredentialReference | None = None
+    operation_payload: dict[str, Any]
+    redis_url: str
+    event_stream_prefix: str
+    outer_identity_field: str = Field(
+        default="operation_id",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$",
+    )
+    max_event_bytes: int
+    max_stream_length: int
+
+
+class ProtocolFailure(Exception):
+    """Stable, sanitized protocol rejection."""
+
+    def __init__(self, code: str, sanitized_message: str) -> None:
+        super().__init__(sanitized_message)
+        self.code = code
+        self.sanitized_message = sanitized_message
+
+
+_SENSITIVE_KEY = re.compile(
+    r"(?:password|passwd|secret|token|access[_-]?key|private[_-]?key|"
+    r"credential|authorization|auth[_-]?(?:header|token|value)|signature)",
+    re.IGNORECASE,
+)
+
+
+def _plaintext_credential_path(value: Any, path: str = "spec") -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}"
+            if (
+                child != "spec.credential_ref"
+                and _SENSITIVE_KEY.search(str(key))
+                and item is not None
+                and item != ""
+                and item is not False
+            ):
+                return child
+            nested = _plaintext_credential_path(item, child)
+            if nested is not None:
+                return nested
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            nested = _plaintext_credential_path(item, f"{path}[{index}]")
+            if nested is not None:
+                return nested
+    elif isinstance(value, str) and "://" in value:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return path
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            if _SENSITIVE_KEY.search(key) and item:
+                return f"{path}.query.{key}"
+    return None
+
+
+def parse_request(
+    raw_payload: str,
     *,
-    job_id: str | None,
-    event_type: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build a JSON-safe event envelope for the KnoVa stream."""
-    result = {
-        "protocol_version": PROTOCOL_VERSION,
-        "event_type": event_type,
-        "job_id": job_id,
-    }
-    if payload:
-        result.update(payload)
-    return result
+    outer_operation_id: str,
+    expected_operation_type: OperationType,
+) -> GenericRequest:
+    """Parse, close, and align one request with its Redis envelope."""
+    try:
+        value = json.loads(raw_payload)
+    except json.JSONDecodeError as exc:
+        raise ProtocolFailure("INVALID_JSON", "payload is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ProtocolFailure("INVALID_REQUEST", "payload root must be an object")
+
+    profile = value.get("protocol_profile")
+    if profile != PROTOCOL_PROFILE:
+        raise ProtocolFailure(
+            "UNSUPPORTED_PROTOCOL_PROFILE", "unsupported protocol profile"
+        )
+    version = value.get("protocol_version")
+    if version != PROTOCOL_VERSION:
+        raise ProtocolFailure(
+            "UNSUPPORTED_PROTOCOL_VERSION", "unsupported protocol version"
+        )
+    leaked = _plaintext_credential_path(value.get("spec"))
+    if leaked is not None:
+        raise ProtocolFailure(
+            "PLAINTEXT_CREDENTIAL", f"plaintext credential is forbidden at {leaked}"
+        )
+    try:
+        request = GenericRequest.model_validate(value)
+    except ValidationError as exc:
+        raise ProtocolFailure(
+            "INVALID_REQUEST", "request schema validation failed"
+        ) from exc
+    if request.operation_id != outer_operation_id:
+        raise ProtocolFailure(
+            "IDENTITY_MISMATCH", "outer operation_id does not match payload identity"
+        )
+    if request.operation_type != expected_operation_type:
+        raise ProtocolFailure(
+            "OPERATION_CHANNEL_MISMATCH",
+            "operation_type does not match the configured task channel",
+        )
+    return request
+
+
+__all__ = [
+    "BatchInferenceSpec",
+    "DriverInput",
+    "GenericRequest",
+    "PROTOCOL_PROFILE",
+    "PROTOCOL_VERSION",
+    "ProtocolFailure",
+    "TrainingSpec",
+    "parse_request",
+]

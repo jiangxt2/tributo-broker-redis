@@ -1,201 +1,132 @@
-"""Best-effort Redis Stream lifecycle reporter."""
+"""Best-effort generic event publication owned by the provider."""
 
 from __future__ import annotations
 
 import json
-import logging
+import re
 import time
-from collections.abc import Callable
+import uuid
 from typing import Any
 
-from tributo.integrations.broker import EventReporter, JobResult
+from tributo_broker_redis.config import ExecutionProfile, OperationType
+from tributo_broker_redis.protocol import PROTOCOL_PROFILE, PROTOCOL_VERSION
 
-from tributo_broker_redis.config import RedisBrokerConfig
-from tributo_broker_redis.protocol import event_payload
+_SENSITIVE_KEY = re.compile(
+    r"(?:password|passwd|secret|token|access[_-]?key|private[_-]?key)", re.IGNORECASE
+)
 
-logger = logging.getLogger(__name__)
+
+def redact(value: Any) -> Any:
+    """Recursively remove values carried by credential-like keys."""
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "credential_ref":
+                result[str(key)] = str(item)
+            elif _SENSITIVE_KEY.search(str(key)):
+                result[str(key)] = "[REDACTED]"
+            else:
+                result[str(key)] = redact(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [redact(item) for item in value]
+    return value
 
 
-class RedisEventReporter(EventReporter):
-    """Publish KnoVa-compatible events with bounded, fail-open retries.
-
-    The public methods follow the Core :class:`EventReporter` contract. The
-    provider-specific ``report_failed_with_code`` method preserves KnoVa's
-    error-code field for invalid task envelopes.
-    """
+class RedisEventReporter:
+    """Publish bounded events for one public operation identity."""
 
     def __init__(
         self,
         redis_client: Any,
-        config: RedisBrokerConfig,
-        job_id: str | None = None,
         *,
-        stream_key: str | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        event_stream_prefix: str,
+        operation_id: str,
+        operation_type: OperationType,
+        execution_profile: ExecutionProfile,
+        run_id: str,
+        attempt_id: str,
+        submission_id: str | None = None,
+        ray_job_id: str | None = None,
+        outer_identity_field: str = "operation_id",
+        max_event_bytes: int = 1024 * 1024,
+        max_stream_length: int = 1000,
     ) -> None:
         self._redis = redis_client
-        self._config = config
-        self._job_id = job_id
-        self._stream_key = stream_key
-        self._sleep = sleep
-        self._terminal_sent = False
-        self._last_failure_log_at: float | None = None
+        self._stream = f"{event_stream_prefix}:{operation_id}"
+        self._outer_identity_field = outer_identity_field
+        self._identity = {
+            "operation_id": operation_id,
+            "operation_type": operation_type,
+            "execution_profile": execution_profile,
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "submission_id": submission_id,
+            "ray_job_id": ray_job_id,
+        }
+        self._max_event_bytes = max_event_bytes
+        self._max_stream_length = max_stream_length
 
     @property
-    def job_id(self) -> str | None:
-        """Return the default job identity bound to this reporter."""
-        return self._job_id
+    def stream_key(self) -> str:
+        return self._stream
 
-    def _publish(
+    def publish(
         self,
-        job_id: str | None,
         event_type: str,
         payload: dict[str, Any] | None = None,
-    ) -> bool:
-        effective_job_id = job_id if job_id is not None else self._job_id
-        if event_type in {"COMPLETED", "FAILED", "CANCELLED"} and self._terminal_sent:
-            logger.warning(
-                "Refusing duplicate terminal event: job_id=%s event_type=%s",
-                effective_job_id,
-                event_type,
-            )
-            return False
-        event = event_payload(
-            job_id=effective_job_id,
-            event_type=event_type,
-            payload={"timestamp": int(time.time() * 1000), **(payload or {})},
-        )
-        try:
-            encoded = json.dumps(event, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "Skipping non-JSON broker event: job_id=%s event_type=%s error=%s",
-                effective_job_id,
-                event_type,
-                type(exc).__name__,
-            )
-            return False
-        if len(encoded.encode("utf-8")) > self._config.max_event_bytes:
-            logger.warning(
-                "Skipping oversized broker event: job_id=%s event_type=%s limit=%d",
-                effective_job_id,
-                event_type,
-                self._config.max_event_bytes,
-            )
-            return False
-        stream_key = self._stream_key or (
-            self._config.event_stream_key(effective_job_id)
-            if effective_job_id is not None
-            else self._config.invalid_event_stream_key
-        )
-        for attempt in range(self._config.max_publish_retries + 1):
-            try:
-                fields = {"payload": encoded}
-                if effective_job_id is not None:
-                    fields["job_id"] = effective_job_id
-                self._redis.xadd(
-                    stream_key,
-                    fields,
-                    maxlen=self._config.max_stream_length,
-                )
-                if event_type in {"COMPLETED", "FAILED", "CANCELLED"}:
-                    self._terminal_sent = True
-                return True
-            except Exception as exc:
-                now = time.monotonic()
-                should_log = (
-                    self._last_failure_log_at is None
-                    or now - self._last_failure_log_at
-                    >= self._config.failure_log_interval
-                )
-                if should_log:
-                    self._last_failure_log_at = now
-                    logger.warning(
-                        "Failed to publish broker event: job_id=%s event_type=%s "
-                        "attempt=%d/%d error=%s",
-                        effective_job_id,
-                        event_type,
-                        attempt + 1,
-                        self._config.max_publish_retries + 1,
-                        type(exc).__name__,
-                        exc_info=True,
-                    )
-                else:
-                    logger.debug(
-                        "Broker event publish retry suppressed from warning log: "
-                        "job_id=%s event_type=%s attempt=%d/%d",
-                        effective_job_id,
-                        event_type,
-                        attempt + 1,
-                        self._config.max_publish_retries + 1,
-                    )
-                if attempt < self._config.max_publish_retries:
-                    self._sleep(self._config.publish_retry_delay)
-        return False
-
-    def report_phase(self, job_id: str, phase: str) -> None:
-        self._publish(job_id, "PHASE", {"phase": phase})
-
-    def report_log(self, job_id: str, message: str, level: str = "INFO") -> None:
-        self._publish(job_id, "LOG", {"message": message, "level": level})
-
-    def report_metrics(
-        self,
-        job_id: str,
-        metrics: dict[str, float],
-        progress: float,
-    ) -> None:
-        self._publish(
-            job_id,
-            "METRICS",
-            {
-                "progress": progress,
-                "progress_percent": round(progress * 100, 1),
-                "metrics": metrics,
-            },
-        )
-
-    def report_completed(self, job_id: str, result: JobResult) -> None:
-        self._publish(
-            job_id,
-            "COMPLETED",
-            {
-                "status": result.status,
-                "run_id": result.run_id,
-                "attempt_id": result.attempt_id,
-                "execution_id": result.execution_id,
-                "submission_id": result.submission_id,
-                "bundle_id": result.bundle_id,
-                "bundle_uri": result.bundle_uri,
-                "manifest_uri": result.manifest_uri,
-                "metrics": result.metrics,
-                "artifacts": result.artifacts,
-                "artifact_refs": result.artifact_refs,
-            },
-        )
-
-    def report_failed(self, job_id: str, error: str) -> None:
-        self.report_failed_with_code(job_id, error)
-
-    def report_failed_with_code(
-        self,
-        job_id: str | None,
-        error: str,
-        error_code: str = "UNKNOWN",
         *,
-        delivery_id: str | None = None,
-    ) -> bool:
-        payload: dict[str, Any] = {
-            "error_message": error,
-            "error_code": error_code,
+        phase: str | None = None,
+    ) -> dict[str, Any]:
+        event = {
+            "protocol_profile": PROTOCOL_PROFILE,
+            "protocol_version": PROTOCOL_VERSION,
+            "event_id": uuid.uuid4().hex,
+            "timestamp_ms": int(time.time() * 1000),
+            **self._identity,
+            "event_type": event_type,
+            "phase": phase,
+            "payload": redact(payload or {}),
         }
-        if delivery_id is not None:
-            payload["delivery_id"] = delivery_id
-        return self._publish(
-            job_id,
-            "FAILED",
-            payload,
+        encoded = json.dumps(
+            event,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        if len(encoded.encode("utf-8")) > self._max_event_bytes:
+            raise ValueError("event exceeds configured size limit")
+        self._redis.xadd(
+            self._stream,
+            {
+                self._outer_identity_field: self._identity["operation_id"],
+                "payload": encoded,
+            },
+            maxlen=self._max_stream_length,
+            approximate=True,
+        )
+        return event
+
+    def phase(self, phase: str) -> dict[str, Any]:
+        return self.publish("PHASE", {"phase": phase}, phase=phase)
+
+    def log(self, message: str, level: str = "INFO") -> dict[str, Any]:
+        return self.publish(
+            "LOG",
+            {"level": level, "message": message[:4096]},
         )
 
-    def report_cancelled(self, job_id: str, phase: str = "TRAINING") -> None:
-        self._publish(job_id, "CANCELLED", {"phase": phase})
+    def failed(self, code: str, error_type: str, phase: str) -> dict[str, Any]:
+        return self.publish(
+            "FAILED",
+            {
+                "error_code": code,
+                "error_type": error_type,
+                "sanitized_message": "operation failed",
+                "retryable": False,
+            },
+            phase=phase,
+        )
+
+
+__all__ = ["RedisEventReporter", "redact"]

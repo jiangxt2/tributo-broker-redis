@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-- Initial standalone Redis Streams Broker API v1 provider.
-- Standalone, Sentinel, and Cluster Redis topology support with Consumer Group
-  pending recovery and deterministic Ray submission reconciliation.
-- Wheel-only Provider discovery, Ray worker wheel injection, and JSON-safe
-  cooperative cancellation support.
-- Fail-open Redis outage handling, bounded event publication retries, invalid
-  message acknowledgement semantics, and lifecycle metrics replay.
+- Standalone Redis Consumer Group delivery for independent training and batch
+  inference channels.
+- Public `tributo-generic-v1` protocol with four healthy execution profiles.
+- One provider execution-driver Ray Job, structured Bundle/ResultSink events,
+  queued cancellation, and Ray Jobs stop for running cancellation.
+- Alpha scope explicitly excludes full recovery, durable events, Sentinel,
+  Cluster, and cross-restart exactly-once guarantees.
