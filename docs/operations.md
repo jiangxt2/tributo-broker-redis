@@ -1,56 +1,132 @@
-# Operations
+# Operations guide
 
-## Failure boundaries
+## Runtime topology
 
-Redis is an optional Tributo control-plane dependency. A Redis outage must
-not change ordinary Tributo training, inference, data access, or CLI behavior.
-The provider follows these boundaries:
+The v0.1 topology has one business Ray Job per Redis task:
 
-- discovery does not connect to Redis;
-- `validate --check-connectivity` is the only explicit CLI probe;
-- consumer startup and polling failures are contained by Core
-  `BrokerRunner`, which enters `DEGRADED`/`RECONNECTING` and applies bounded
-  backoff;
-- event publication is best effort with bounded retries and rate-limited
-  warnings;
-- a completed Ray Job is not failed because its reporter cannot publish;
-- invalid messages are removed from the task stream after best-effort FAILED
-  reporting, even when the invalid-event stream is unavailable;
-- temporary task submission failures remain pending for later recovery.
+```text
+Redis task Stream
+  -> provider consume loop
+  -> deterministic RayJobSubmission
+  -> provider execution-driver Ray Job
+  -> Tributo in-process training or batch-inference API
+  -> Bundle or ResultSink
+  -> provider event Stream
+```
 
-## Redis topology
+Operation mappings only validate and prepare driver input. They do not call a
+training or inference submission API, so inference cannot create a nested Ray
+Job.
 
-Standalone uses `url` or `host`/`port` and an optional logical `db`.
-Sentinel uses `sentinel_hosts`, `sentinel_service`, and `db`. If Sentinel
-announces an internal address behind NAT, use `sentinel_address_map` to map
-each advertised `host:port` to a client-reachable address. The optional
-`sentinel_force_master_ip` setting is supported by the redis-py range declared
-by this package.
-Cluster uses `cluster_startup_nodes` and requires `db: 0`. If Redis announces
-internal node hosts, use `cluster_address_remap_host` to map them to the
-client-reachable host.
+## Admission and ACK
 
-Use unique stream keys and consumer groups per environment. Do not reuse a
-fixed consumer name across independent provider processes unless the shared
-consumer identity is intentional. The default name is unique per process.
+The consumer validates protocol, outer identity, supported operation/profile,
+and queued cancellation before admission. It then submits or reconciles a
+deterministic `submission_id`, records the in-memory active mapping, publishes
+`ACCEPTED`, and calls `XACK`.
 
-## Pending recovery
+`ACK` means Ray accepted the execution, not that execution completed. An
+ambiguous Ray response is queried by the same `submission_id`; if admission
+cannot be confirmed, the Redis delivery remains pending. An invalid or
+unsupported request publishes a sanitized `FAILED` event and is ACKed to avoid
+a poison loop.
 
-The provider uses `XAUTOCLAIM` after `claim_idle_ms`. The Redis-returned cursor
-is retained between recovery rounds; when Redis returns `0-0`, the next round
-starts a new scan. Increase `claim_count` for large PELs while balancing
-recovery work against normal task polling.
+The event Stream is best effort. It is not an outbox or terminal ledger.
+Failures to publish `PHASE`, `LOG`, `METRICS`, or `PROGRESS` are logged and do
+not replace a successful workload result with `EXECUTION_FAILED`. The driver
+makes at most one immediate retry for a transient nonterminal publication
+failure; this is not a durable delivery guarantee.
 
-## Secret handling
+New consumer groups start at `0-0`, so tasks already present in a newly
+configured Stream are eligible for delivery. `block_ms` must be a positive,
+finite timeout; explicit zero-timeout polls are issued without Redis `BLOCK`
+and are therefore nonblocking.
 
-Only environment variable names are serialized in provider configuration.
-Passwords must be injected into the process or Ray runtime environment under
-the configured name. Never put a password in a Redis URL, JSON config, task
-payload, event, exception, or log message.
+## Cancellation
+
+Each operation has an independent cancel key prefix.
+
+- Before admission, an existing cancel key produces `CANCELLED` and ACK; no
+  Ray Job is created. A failed cancel-key check is fail-closed and leaves the
+  delivery pending.
+- After admission, the provider watcher calls `stop_job(submission_id)`. It
+  publishes `CANCELLED` only after Ray reports `STOPPED`.
+- If Ray already reports `SUCCEEDED` or `FAILED`, a later cancel key has no
+  effect.
+- If Ray reports `STOPPED` without a provider stop request, the watcher removes
+  the process-local active entry without publishing `CANCELLED`. Consumers must
+  use the accepted `submission_id` to inspect Ray status; v0.1 does not invent a
+  provider cancellation reason for an external stop.
+
+The active operation map is process-local. Restart recovery and cooperative
+worker cancellation are not v0.1 guarantees.
+
+The watcher checks for an existing terminal event before requesting a stop,
+but artifact persistence and event publication are not transactional in v0.1.
+If cancellation lands in that narrow interval, consumers must treat a durable
+Bundle or ResultSink receipt as the execution fact. Durable terminal
+arbitration belongs to the later reliability phase.
+
+## Credentials
+
+Tasks may include only a reference such as `env:OBJECT_STORE_PROFILE` or
+`mount:/var/run/secrets/object-store`. The execution driver verifies the
+reference inside its pre-provisioned Ray runtime. It does not copy the value
+into Ray metadata or request-derived runtime env.
+
+Credential values are also rejected when embedded as URI user information or
+sensitive query parameters. Arbitrary opaque values cannot be classified as
+secrets generically; integrations must use `credential_ref` rather than
+placing credential material in operation configuration maps.
+`credential_ref` is accepted only as the direct `spec.credential_ref` field;
+nested lookalike fields are rejected.
+
+If execution succeeds but the `COMPLETED` event cannot be encoded or
+published, the driver classifies the notification failure as
+`TERMINAL_EVENT_PUBLICATION_FAILED`, not as an execution failure. Event
+delivery remains best effort.
+
+Redis URLs must be credential-free. Deployments that require authenticated
+Redis should add an independently reviewed client/secret integration in a
+later provider version; plaintext URL credentials are rejected in v0.1.
 
 ## Observability
 
-Alert on repeated `DEGRADED`/`RECONNECTING` transitions, pending-message growth,
-and reporter warning logs. Event consumers should deduplicate using the
-business job identity and event payload because Redis Streams delivery is
-at-least-once.
+Use the channel's configured outer identity field (default `operation_id`) to
+route task and event entries, and use `submission_id` to query Ray Jobs. Event
+JSON retains canonical `operation_id` and includes public protocol identity, event ID,
+timestamp, operation/run/attempt identity, optional `ray_job_id`, phase, and a
+bounded redacted payload.
+
+Expected training events include `PHASE`, `LOG`, `METRICS`, and a terminal
+event. Expected inference events include `PHASE`, `LOG`, `PROGRESS`, and a
+terminal event. `COMPLETED` carries a credential-free Bundle or ResultSink
+reference.
+
+## Alpha failure boundary
+
+An external supervisor may restart the consume process after a Redis outage.
+XAUTOCLAIM remains a best-effort hook, but the release does not promise cursor
+persistence, reconnect state restoration, DLQ behavior, HA, durable events,
+or cross-restart exactly-once execution.
+
+## Validation
+
+Run configuration validation before starting the service:
+
+```bash
+tributo-broker-redis validate --config /etc/tributo/redis-provider.json
+tributo-broker-redis validate --config /etc/tributo/redis-provider.json --check-connectivity
+```
+
+Configuration validation requires a Core source root usable by Ray runtime
+packaging and an explicit provider driver distribution before the consumer
+group is opened or any task is read. Compatibility with the Core
+`submit_ray_job()` runtime-env extension contract is verified by the pinned
+Core baseline, static typing, wheel contract, and Redis/Ray integration matrix.
+
+Start the provider-owned loop under a process supervisor:
+
+```bash
+tributo-broker-redis consume --config /etc/tributo/redis-provider.json
+```

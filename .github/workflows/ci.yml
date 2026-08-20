@@ -5,10 +5,9 @@ on:
   pull_request:
 
 env:
-  # Keep CI on the same Broker API branch used by the local wheel IT until
-  # that Core line is published to the package index.
+  # Pin the exact Core baseline used by the provider wheel and Redis/Ray matrix.
   TRIBUTO_CORE_REPOSITORY: jiangxt2/Tributo
-  TRIBUTO_CORE_REF: feat/redis-stream-integration
+  TRIBUTO_CORE_REF: 8a3bb4dfecd7fd6574d764b45d5f28c1ca73ed66
 
 jobs:
   unit:

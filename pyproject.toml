@@ -1,21 +1,22 @@
 [project]
 name = "tributo-broker-redis"
 version = "0.1.0"
-description = "Redis Streams broker plugin for Tributo training control-plane jobs"
+description = "Redis Streams provider for Tributo Broker API v1"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Tributo Contributors" }]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "tributo>=1.0,<2.0",
-    "redis>=6.0,<8.0",
+    "redis>=6.0,<9.0",
     "pydantic>=2.0,<3.0",
+    "packaging>=24.0",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +28,7 @@ dev = [
 ]
 
 [project.entry-points."tributo.brokers"]
-knova-redis = "tributo_broker_redis.plugin:RedisBrokerPlugin"
+tributo-redis = "tributo_broker_redis.plugin:RedisBrokerPlugin"
 
 [project.scripts]
 tributo-broker-redis = "tributo_broker_redis.cli:main"

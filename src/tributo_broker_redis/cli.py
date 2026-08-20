@@ -1,23 +1,68 @@
-"""Standalone provider diagnostics entry point."""
+"""Provider-owned validation and production consume CLI."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import signal
 from pathlib import Path
+from typing import Any
 
+from tributo_broker_redis.config import normalize_config
 from tributo_broker_redis.plugin import RedisBrokerPlugin
+from tributo_broker_redis.runtime import RedisBrokerRuntime
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Tributo Redis broker provider")
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--check-connectivity", action="store_true")
-    args = parser.parse_args()
-    config = json.loads(args.config.read_text(encoding="utf-8"))
-    RedisBrokerPlugin().validate_config(
-        config,
-        check_connectivity=args.check_connectivity,
-    )
-    print("Redis broker configuration is valid")
-    return 0
+def _read_config(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("provider config root must be an object")
+    return value
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Tributo Redis Streams provider")
+    commands = parser.add_subparsers(dest="command", required=True)
+    validate = commands.add_parser("validate", help="validate provider config")
+    validate.add_argument("--config", type=Path, required=True)
+    validate.add_argument("--check-connectivity", action="store_true")
+    consume = commands.add_parser("consume", help="run the provider consume loop")
+    consume.add_argument("--config", type=Path, required=True)
+    consume.add_argument("--once", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    raw = _read_config(args.config)
+    if args.command == "validate":
+        RedisBrokerPlugin().validate_config(
+            raw,
+            check_connectivity=args.check_connectivity,
+        )
+        print("Redis broker configuration is valid")
+        return 0
+
+    runtime = RedisBrokerRuntime(normalize_config(raw))
+
+    def _stop(_signum: int, _frame: object) -> None:
+        runtime.close()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        runtime.start()
+        if args.once:
+            runtime.run_once()
+        else:
+            runtime.run_forever()
+        return 0
+    finally:
+        runtime.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ["main"]
