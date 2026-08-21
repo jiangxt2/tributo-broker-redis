@@ -73,6 +73,8 @@ class DriverInput(_StrictModel):
     credential_ref: CredentialReference | None = None
     operation_payload: dict[str, Any]
     redis_url: str
+    redis_transport: dict[str, Any] | None = None
+    redis_hash_tag: str | None = None
     event_stream_prefix: str
     outer_identity_field: str = Field(
         default="operation_id",

@@ -61,9 +61,11 @@ class RedisEventReporter:
         terminal_candidate_key_prefix: str = "tributo:terminal-candidate",
         terminal_candidate_ttl_seconds: int = 7 * 24 * 60 * 60,
         wire_protocol_profile: str = "tributo-generic-v1",
+        redis_hash_tag: str | None = None,
     ) -> None:
         self._redis = redis_client
-        self._stream = f"{event_stream_prefix}:{operation_id}"
+        stream_identity = f"{{{redis_hash_tag}}}" if redis_hash_tag else operation_id
+        self._stream = f"{event_stream_prefix}:{stream_identity}"
         self._outer_identity_field = outer_identity_field
         self._identity = {
             "operation_id": operation_id,

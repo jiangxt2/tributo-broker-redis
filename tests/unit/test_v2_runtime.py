@@ -103,6 +103,8 @@ def test_v2_training_reuses_generic_driver_without_affecting_batch_channel(
         )
     )
     assert driver["operation_type"] == "training"
+    assert driver["redis_transport"]["mode"] == "standalone"
+    assert "opaque-password" not in json.dumps(driver["redis_transport"])
     assert driver["execution_profile"] == "distributed"
     assert driver["wire_protocol_profile"] == "knova-training-v2"
     assert driver["operation_payload"]["v2_completion_context"]["model_id"] == (

@@ -17,6 +17,47 @@ from tributo_broker_redis.config import (
 
 logger = logging.getLogger(__name__)
 
+
+def _cluster_primary_nodes(redis_client: Any) -> tuple[Any, ...]:
+    get_nodes = getattr(redis_client, "get_nodes", None)
+    if not callable(get_nodes):
+        return ()
+    return tuple(
+        sorted(
+            (
+                node
+                for node in get_nodes()
+                if getattr(node, "server_type", "primary") == "primary"
+            ),
+            key=lambda node: str(node.name),
+        )
+    )
+
+
+def _cluster_scan_cursor(raw_cursor: Any, node_name: str) -> int:
+    if isinstance(raw_cursor, dict):
+        if node_name not in raw_cursor:
+            raise RuntimeError(
+                f"Redis Cluster SCAN cursor map is missing node {node_name!r}"
+            )
+        raw_cursor = raw_cursor[node_name]
+    if isinstance(raw_cursor, bool) or not isinstance(raw_cursor, (int, str, bytes)):
+        raise RuntimeError(
+            f"Redis Cluster SCAN returned an invalid cursor for node {node_name!r}"
+        )
+    try:
+        cursor = int(raw_cursor)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"Redis Cluster SCAN returned an invalid cursor for node {node_name!r}"
+        ) from error
+    if cursor < 0:
+        raise RuntimeError(
+            f"Redis Cluster SCAN returned an invalid cursor for node {node_name!r}"
+        )
+    return cursor
+
+
 _SAVE_ACTIVE_LUA = r"""
 -- SAVE_ACTIVE_OPERATION
 local raw = redis.call('GET', KEYS[1])
@@ -131,22 +172,54 @@ class ActiveOperationStore:
                 state = json.loads(_decode(state_raw)) if state_raw is not None else {}
             except (TypeError, json.JSONDecodeError):
                 state = {}
-            cursor = int(state.get("cursor", 0))
             pending = list(state.get("pending", []))
-            while len(pending) < budget:
-                cursor, discovered = scan(
-                    cursor=cursor,
-                    match=f"{self._durability.active_key_prefix}:*",
-                    count=budget,
+            cluster_nodes = _cluster_primary_nodes(self._redis)
+            if cluster_nodes:
+                legacy_cursors = state.get("cursor", {})
+                stored_cursors = state.get("node_cursors", legacy_cursors)
+                node_cursors = (
+                    {str(name): int(cursor) for name, cursor in stored_cursors.items()}
+                    if isinstance(stored_cursors, dict)
+                    else {}
                 )
-                pending.extend(_decode(key) for key in discovered)
-                if cursor == 0 or pending:
-                    break
+                node_index = int(state.get("node_index", 0)) % len(cluster_nodes)
+                visited = 0
+                while len(pending) < budget and visited < len(cluster_nodes):
+                    node = cluster_nodes[node_index]
+                    node_name = str(node.name)
+                    next_cursor, discovered = scan(
+                        cursor=node_cursors.get(node_name, 0),
+                        match=f"{self._durability.active_key_prefix}:*",
+                        count=budget - len(pending),
+                        target_nodes=node,
+                    )
+                    node_cursors[node_name] = _cluster_scan_cursor(
+                        next_cursor, node_name
+                    )
+                    pending.extend(_decode(key) for key in discovered)
+                    node_index = (node_index + 1) % len(cluster_nodes)
+                    visited += 1
+                scan_state: dict[str, Any] = {
+                    "node_cursors": node_cursors,
+                    "node_index": node_index,
+                }
+            else:
+                cursor = int(state.get("cursor", 0))
+                while len(pending) < budget:
+                    cursor, discovered = scan(
+                        cursor=cursor,
+                        match=f"{self._durability.active_key_prefix}:*",
+                        count=budget - len(pending),
+                    )
+                    pending.extend(_decode(key) for key in discovered)
+                    if cursor == 0 or pending:
+                        break
+                scan_state = {"cursor": cursor}
             keys = pending[:budget]
             self._redis.set(
                 state_key,
                 json.dumps(
-                    {"cursor": int(cursor), "pending": pending[budget:]},
+                    {**scan_state, "pending": pending[budget:]},
                     separators=(",", ":"),
                 ),
             )
@@ -220,8 +293,21 @@ class TerminalCandidateStore:
         )
 
 
+def assert_cluster_safe_lua() -> None:
+    """Durability scripts are single-key and operation keys share one hash tag."""
+    for script in (_SAVE_ACTIVE_LUA, _STAGE_CANDIDATE_LUA):
+        if "KEYS[2]" in script:
+            raise AssertionError("durability Lua must use exactly one Redis key")
+    durability = DurabilityConfig()
+    active = durability.active_key("training", "job-1")
+    candidate = durability.terminal_candidate_key("training", "job-1")
+    if active[active.index("{") :] != candidate[candidate.index("{") :]:
+        raise AssertionError("durability keys must share one Redis Cluster hash tag")
+
+
 __all__ = [
     "ActiveOperationRecord",
     "ActiveOperationStore",
     "TerminalCandidateStore",
+    "assert_cluster_safe_lua",
 ]

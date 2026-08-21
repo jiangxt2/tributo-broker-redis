@@ -17,13 +17,18 @@ def _string(options: Mapping[str, Any], name: str) -> str:
     return value
 
 
+def _redis_connection(options: Mapping[str, Any]) -> Mapping[str, Any] | str:
+    value = options.get("redis_transport")
+    return value if isinstance(value, Mapping) else _string(options, "redis_url")
+
+
 class RedisCancellationChecker:
     """Check one exact Provider-owned cancellation key."""
 
     def __init__(self, job_id: str, options: Mapping[str, Any]) -> None:
         self._job_id = job_id
         self._cancel_key = _string(options, "cancel_key")
-        self._redis = create_redis_client(_string(options, "redis_url"))
+        self._redis = create_redis_client(_redis_connection(options))
 
     def is_cancelled(self, job_id: str) -> bool:
         if job_id != self._job_id:
@@ -37,7 +42,7 @@ class RedisTrainingEventReporter:
     def __init__(self, job_id: str, options: Mapping[str, Any]) -> None:
         self._job_id = job_id
         self._reporter = RedisEventReporter(
-            create_redis_client(_string(options, "redis_url")),
+            create_redis_client(_redis_connection(options)),
             event_stream_prefix=_string(options, "event_stream_prefix"),
             operation_id=job_id,
             operation_type=cast(OperationType, _string(options, "operation_type")),
@@ -57,6 +62,11 @@ class RedisTrainingEventReporter:
                 options.get("terminal_candidate_ttl_seconds", 7 * 24 * 60 * 60)
             ),
             wire_protocol_profile=_string(options, "wire_protocol_profile"),
+            redis_hash_tag=(
+                str(options["redis_hash_tag"])
+                if options.get("redis_hash_tag") is not None
+                else None
+            ),
         )
 
     def _require_identity(self, job_id: str) -> None:

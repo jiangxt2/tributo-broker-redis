@@ -9,8 +9,9 @@ The release gate covers these healthy paths:
 
 - XGBoost training with `single_worker` and `distributed` profiles;
 - Bundle-backed batch inference with `single_worker` and `distributed` profiles;
-- Standalone Redis, Redis consumer groups, one provider execution-driver Ray
-  Job, Bundle or ResultSink output, and optional durable terminal publication;
+- Standalone, Sentinel, or Cluster Redis; Redis consumer groups; one provider
+  execution-driver Ray Job; Bundle or ResultSink output; and optional durable
+  terminal publication;
 - the generic v1 training/inference contract plus strict KnoVa training v2;
 - queued cancellation, worker-round cancellation, running cancellation and
   deadline handling through confirmed Ray Jobs stop.
@@ -19,7 +20,9 @@ Unknown protocol fields and unsupported algorithms or profiles fail closed.
 With `durability.enabled=true`, Redis-backed active records, terminal
 candidates, single-key Lua terminal uniqueness and bounded supervisor recovery
 survive Provider restarts. This is not general exactly-once task execution and
-does not add DLQ processing, Sentinel, Cluster, or HA.
+does not add DLQ processing. Redis standalone, Sentinel, and Cluster topologies
+share one credential-free descriptor; credentials are resolved only from
+pre-provisioned environment variables and TLS material from mounted paths.
 
 ## Installation
 

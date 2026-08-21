@@ -12,6 +12,7 @@ from tributo_broker_redis.active_jobs import (
     ActiveOperationRecord,
     ActiveOperationStore,
     TerminalCandidateStore,
+    assert_cluster_safe_lua,
 )
 from tributo_broker_redis.config import RedisBrokerConfig
 from tributo_broker_redis.reporter import RedisEventReporter
@@ -157,6 +158,7 @@ def test_lua_guard_allows_only_one_terminal_and_rejects_late_events() -> None:
     assert len(stream) == 1
     assert json.loads(stream[0]["payload"])["event_type"] == "COMPLETED"
     assert_single_key_lua()
+    assert_cluster_safe_lua()
 
 
 def test_active_keys_do_not_collide_between_channels(
@@ -232,6 +234,91 @@ def test_active_scan_persists_cursor_and_covers_all_keys_across_ticks(
 
     assert observed == expected
     assert "poisoned active operation" in caplog.text
+
+
+def test_cluster_scan_cursor_map_is_persisted_and_fair(
+    raw_config: dict[str, Any],
+) -> None:
+    config = durable_config(raw_config)
+    durability = config.durability.model_copy(update={"supervisor_scan_count": 2})
+
+    class ClusterPagingRedis(DurableRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.nodes = (
+                type("Node", (), {"name": "node-a", "server_type": "primary"})(),
+                type("Node", (), {"name": "node-b", "server_type": "primary"})(),
+            )
+            self.scan_calls: list[tuple[str, int]] = []
+            self.pages: dict[tuple[str, int], tuple[int, list[str]]] = {}
+
+        def get_nodes(self) -> tuple[Any, ...]:
+            return self.nodes
+
+        def scan(
+            self,
+            *,
+            cursor: int,
+            match: str,
+            count: int,
+            target_nodes: Any,
+        ) -> tuple[dict[str, int], list[str]]:
+            del match, count
+            assert isinstance(cursor, int), "RedisCluster.scan requires an int cursor"
+            assert target_nodes in self.nodes
+            node_name = str(target_nodes.name)
+            self.scan_calls.append((node_name, cursor))
+            next_cursor, page = self.pages[(node_name, cursor)]
+            return {node_name: next_cursor}, page
+
+    redis = ClusterPagingRedis()
+    records = [active(operation_id=f"cluster-{index}") for index in range(4)]
+    keys = []
+    for record in records:
+        key = durability.active_key("training", record.operation_id)
+        redis.values[key] = record.encode()
+        keys.append(key)
+    # Node A deliberately returns an empty first page with a continuation cursor.
+    # Node B supplies work on tick one; fair rotation returns to A on tick two.
+    redis.pages = {
+        ("node-a", 0): (7, []),
+        ("node-b", 0): (0, keys[:2]),
+        ("node-a", 7): (0, keys[2:]),
+    }
+    store = ActiveOperationStore(redis, durability)
+
+    observed = [*store.scan(), *store.scan()]
+
+    assert {item.operation_id for item in observed} == {
+        item.operation_id for item in records
+    }
+    assert redis.scan_calls == [("node-a", 0), ("node-b", 0), ("node-a", 7)]
+
+
+def test_cluster_scan_cursor_map_missing_target_node_fails_closed(
+    raw_config: dict[str, Any],
+) -> None:
+    config = durable_config(raw_config)
+
+    class InvalidClusterRedis(DurableRedis):
+        node = type("Node", (), {"name": "node-a", "server_type": "primary"})()
+
+        def get_nodes(self) -> tuple[Any, ...]:
+            return (self.node,)
+
+        def scan(
+            self,
+            *,
+            cursor: int,
+            match: str,
+            count: int,
+            target_nodes: Any,
+        ) -> tuple[dict[str, int], list[str]]:
+            del cursor, match, count, target_nodes
+            return {"another-node": 0}, []
+
+    with pytest.raises(RuntimeError, match="node-a"):
+        tuple(ActiveOperationStore(InvalidClusterRedis(), config.durability).scan())
 
 
 def test_supervisor_replays_candidate_before_ray_status(

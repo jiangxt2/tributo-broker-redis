@@ -25,11 +25,23 @@ class _StrictModel(BaseModel):
 
 
 class RedisTransportConfig(_StrictModel):
-    """Standalone Redis connection used by the consumer and Ray driver."""
+    """Credential-free Redis topology used by every provider process."""
 
-    mode: Literal["standalone"] = "standalone"
+    mode: Literal["standalone", "sentinel", "cluster"] = "standalone"
     url: str = "redis://127.0.0.1:6379/0"
     driver_url: str | None = None
+    sentinel_urls: tuple[str, ...] = ()
+    sentinel_master_name: str | None = Field(default=None, min_length=1)
+    cluster_urls: tuple[str, ...] = ()
+    username_env: str | None = None
+    password_env: str | None = None
+    sentinel_username_env: str | None = None
+    sentinel_password_env: str | None = None
+    database: int = Field(default=0, ge=0, le=15)
+    tls_ca_cert_path: str | None = None
+    tls_cert_path: str | None = None
+    tls_key_path: str | None = None
+    socket_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     block_ms: int = Field(default=1000, ge=1, le=60000)
     claim_idle_ms: int = Field(default=60000, ge=0)
     claim_count: int = Field(default=10, ge=1, le=1000)
@@ -51,9 +63,113 @@ class RedisTransportConfig(_StrictModel):
             raise ValueError("Redis URL must not contain query or fragment")
         return value
 
+    @field_validator("sentinel_urls", "cluster_urls")
+    @classmethod
+    def _credential_free_nodes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values):
+            raise ValueError("Redis topology URLs must be unique")
+        for value in values:
+            cls._credential_free_url(value)
+        return values
+
+    @field_validator(
+        "username_env",
+        "password_env",
+        "sentinel_username_env",
+        "sentinel_password_env",
+    )
+    @classmethod
+    def _credential_environment_name(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("Redis credential env reference is invalid")
+        return value
+
+    @field_validator("tls_ca_cert_path", "tls_cert_path", "tls_key_path")
+    @classmethod
+    def _absolute_tls_path(cls, value: str | None) -> str | None:
+        if value is not None and (not value.startswith("/") or "\x00" in value):
+            raise ValueError("Redis TLS files must use absolute mount paths")
+        return value
+
+    @model_validator(mode="after")
+    def _topology_contract(self) -> RedisTransportConfig:
+        if self.mode == "standalone":
+            if (
+                self.sentinel_urls
+                or self.sentinel_master_name
+                or self.sentinel_username_env
+                or self.sentinel_password_env
+                or self.cluster_urls
+            ):
+                raise ValueError("standalone mode rejects Sentinel/Cluster fields")
+            for value in self.connection_urls:
+                path = urlsplit(value).path
+                url_database = int(path.lstrip("/") or 0)
+                if url_database != self.database:
+                    raise ValueError("standalone URL database path must match database")
+        elif self.mode == "sentinel":
+            if not self.sentinel_urls or not self.sentinel_master_name:
+                raise ValueError(
+                    "sentinel mode requires sentinel_urls and sentinel_master_name"
+                )
+            if self.cluster_urls or self.driver_url is not None:
+                raise ValueError("sentinel mode rejects Cluster/driver_url fields")
+            if any(
+                urlsplit(value).path not in {"", "/"} for value in self.sentinel_urls
+            ):
+                raise ValueError("Sentinel node URLs must not contain a database path")
+        else:
+            if not self.cluster_urls:
+                raise ValueError("cluster mode requires cluster_urls")
+            if (
+                self.sentinel_urls
+                or self.sentinel_master_name
+                or self.sentinel_username_env
+                or self.sentinel_password_env
+                or self.driver_url
+            ):
+                raise ValueError("cluster mode rejects Sentinel/driver_url fields")
+            for value in self.cluster_urls:
+                path = urlsplit(value).path
+                if path not in {"", "/", "/0"}:
+                    raise ValueError("Redis Cluster only supports database 0")
+            if self.database != 0:
+                raise ValueError("Redis Cluster only supports database 0")
+        tls_values = (
+            self.tls_ca_cert_path,
+            self.tls_cert_path,
+            self.tls_key_path,
+        )
+        if len({urlsplit(value).scheme for value in self.connection_urls}) != 1:
+            raise ValueError("Redis topology URLs must use one TLS mode")
+        if any(tls_values) and not all(
+            urlsplit(value).scheme == "rediss" for value in self.connection_urls
+        ):
+            raise ValueError("Redis TLS files require rediss:// topology URLs")
+        if (self.tls_cert_path is None) != (self.tls_key_path is None):
+            raise ValueError(
+                "Redis client certificate and key must be configured together"
+            )
+        return self
+
+    @property
+    def connection_urls(self) -> tuple[str, ...]:
+        if self.mode == "sentinel":
+            return self.sentinel_urls
+        if self.mode == "cluster":
+            return self.cluster_urls
+        return (self.url,) if self.driver_url is None else (self.url, self.driver_url)
+
     @property
     def ray_driver_url(self) -> str:
         return self.driver_url or self.url
+
+    def connection_descriptor(self, *, for_driver: bool = False) -> dict[str, Any]:
+        value = self.model_dump(mode="json")
+        if for_driver and self.mode == "standalone":
+            value["url"] = self.ray_driver_url
+            value["driver_url"] = None
+        return value
 
 
 class ChannelConfig(_StrictModel):
@@ -76,11 +192,17 @@ class ChannelConfig(_StrictModel):
             raise ValueError("outer_identity_field must not be payload")
         return value
 
-    def event_stream_key(self, operation_id: str) -> str:
-        return f"{self.event_stream_prefix}:{operation_id}"
+    def event_stream_key(
+        self, operation_id: str, *, redis_hash_tag: str | None = None
+    ) -> str:
+        identity = f"{{{redis_hash_tag}}}" if redis_hash_tag else operation_id
+        return f"{self.event_stream_prefix}:{identity}"
 
-    def cancel_key(self, operation_id: str) -> str:
-        return f"{self.cancel_key_prefix}:{operation_id}"
+    def cancel_key(
+        self, operation_id: str, *, redis_hash_tag: str | None = None
+    ) -> str:
+        identity = f"{{{redis_hash_tag}}}" if redis_hash_tag else operation_id
+        return f"{self.cancel_key_prefix}:{identity}"
 
 
 class ChannelSet(_StrictModel):

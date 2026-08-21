@@ -96,6 +96,11 @@ class ActiveOperationSupervisor:
     def _channel(self, record: ActiveOperationRecord) -> ChannelConfig:
         return self._config.channels.for_operation(record.operation_type)
 
+    def _redis_hash_tag(self, record: ActiveOperationRecord) -> str | None:
+        if self._config.transport.mode != "cluster":
+            return None
+        return f"{record.operation_type}:{record.operation_id}"
+
     def _guard(self, record: ActiveOperationRecord) -> TerminalGuard:
         return TerminalGuard(
             self._redis,
@@ -105,7 +110,9 @@ class ActiveOperationSupervisor:
 
     def _terminal(self, record: ActiveOperationRecord) -> dict[str, Any] | None:
         return self._guard(record).terminal_event(
-            self._channel(record).event_stream_key(record.operation_id),
+            self._channel(record).event_stream_key(
+                record.operation_id, redis_hash_tag=self._redis_hash_tag(record)
+            ),
             record.operation_id,
         )
 
@@ -124,7 +131,9 @@ class ActiveOperationSupervisor:
         if event_type not in TERMINAL_EVENT_TYPES:
             raise ValueError("terminal candidate is not terminal")
         result = self._guard(record).publish(
-            self._channel(record).event_stream_key(record.operation_id),
+            self._channel(record).event_stream_key(
+                record.operation_id, redis_hash_tag=self._redis_hash_tag(record)
+            ),
             operation_id=record.operation_id,
             encoded_event=encoded,
             event_type=str(event_type),
@@ -157,6 +166,7 @@ class ActiveOperationSupervisor:
                 self._config.durability.terminal_candidate_ttl_seconds
             ),
             wire_protocol_profile=record.wire_protocol_profile,
+            redis_hash_tag=self._redis_hash_tag(record),
         )
 
     def _publish_terminal(
@@ -208,7 +218,10 @@ class ActiveOperationSupervisor:
                 return
             if bool(
                 self._redis.exists(
-                    self._channel(record).cancel_key(record.operation_id)
+                    self._channel(record).cancel_key(
+                        record.operation_id,
+                        redis_hash_tag=self._redis_hash_tag(record),
+                    )
                 )
             ):
                 self._request_stop(record, "CANCELLED")

@@ -210,7 +210,18 @@ class RedisBrokerRuntime(BrokerRuntime):
                 self.config.durability.terminal_candidate_ttl_seconds
             ),
             wire_protocol_profile=wire_protocol_profile,
+            redis_hash_tag=self._redis_hash_tag(operation_type, operation_id),
         )
+
+    def _redis_hash_tag(
+        self, operation_type: OperationType, operation_id: str
+    ) -> str | None:
+        if (
+            self.config.transport.mode != "cluster"
+            or not self.config.durability.enabled
+        ):
+            return None
+        return f"{operation_type}:{operation_id}"
 
     def _invalid(
         self,
@@ -369,8 +380,11 @@ class RedisBrokerRuntime(BrokerRuntime):
         )
         if request_digest is None:
             request_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        redis_hash_tag = self._redis_hash_tag(operation_type, operation_id)
         if self._supervisor is not None:
-            stream = channel.event_stream_key(operation_id)
+            stream = channel.event_stream_key(
+                operation_id, redis_hash_tag=redis_hash_tag
+            )
             terminal = TerminalGuard(
                 self._redis,
                 outer_identity_field=channel.outer_identity_field,
@@ -393,7 +407,11 @@ class RedisBrokerRuntime(BrokerRuntime):
                     ),
                 )
         try:
-            if bool(self._redis.exists(channel.cancel_key(operation_id))):
+            if bool(
+                self._redis.exists(
+                    channel.cancel_key(operation_id, redis_hash_tag=redis_hash_tag)
+                )
+            ):
                 reporter.publish(
                     "CANCELLED",
                     {"reason": "cancelled before admission"},
@@ -421,6 +439,10 @@ class RedisBrokerRuntime(BrokerRuntime):
             credential_ref=prepared.credential_ref,
             operation_payload=prepared.operation_payload,
             redis_url=self.config.transport.ray_driver_url,
+            redis_transport=self.config.transport.connection_descriptor(
+                for_driver=True
+            ),
+            redis_hash_tag=redis_hash_tag,
             event_stream_prefix=channel.event_stream_prefix,
             outer_identity_field=channel.outer_identity_field,
             max_event_bytes=self.config.transport.max_event_bytes,
@@ -451,6 +473,9 @@ class RedisBrokerRuntime(BrokerRuntime):
         if protocol_profile == "knova-training-v2":
             shared_options = {
                 "redis_url": self.config.transport.ray_driver_url,
+                "redis_transport": self.config.transport.connection_descriptor(
+                    for_driver=True
+                ),
                 "event_stream_prefix": channel.event_stream_prefix,
                 "operation_type": operation_type,
                 "execution_profile": execution_profile,
@@ -467,6 +492,7 @@ class RedisBrokerRuntime(BrokerRuntime):
                     self.config.durability.terminal_candidate_ttl_seconds
                 ),
                 "wire_protocol_profile": protocol_profile,
+                "redis_hash_tag": redis_hash_tag,
             }
             execution_context = {
                 "schema": "tributo.execution-context",
@@ -479,7 +505,12 @@ class RedisBrokerRuntime(BrokerRuntime):
                     "job_id": operation_id,
                     "options": {
                         "redis_url": self.config.transport.ray_driver_url,
-                        "cancel_key": channel.cancel_key(operation_id),
+                        "redis_transport": (
+                            self.config.transport.connection_descriptor(for_driver=True)
+                        ),
+                        "cancel_key": channel.cancel_key(
+                            operation_id, redis_hash_tag=redis_hash_tag
+                        ),
                     },
                 },
                 "event_reporter": {

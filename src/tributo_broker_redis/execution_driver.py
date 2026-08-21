@@ -116,6 +116,7 @@ def _reporter(
         terminal_candidate_key_prefix=value.terminal_candidate_key_prefix,
         terminal_candidate_ttl_seconds=value.terminal_candidate_ttl_seconds,
         wire_protocol_profile=value.wire_protocol_profile,
+        redis_hash_tag=value.redis_hash_tag,
     )
 
 
@@ -300,7 +301,7 @@ def _run_batch_inference(
 
 def main() -> int:
     value, submission_id = _load_driver_input()
-    redis_client = create_redis_client(value.redis_url)
+    redis_client = create_redis_client(value.redis_transport or value.redis_url)
     reporter = _reporter(value, redis_client, submission_id)
     try:
         _resolve_credential_reference(value.credential_ref)
