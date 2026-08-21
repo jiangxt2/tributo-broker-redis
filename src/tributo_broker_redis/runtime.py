@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import logging
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from tributo.integrations.broker import (
     BrokerError,
     BrokerRuntime,
     Message,
+    TaskConsumer,
     TaskDisposition,
     TaskOutcome,
 )
 from tributo.ray_jobs import RayJobSubmission, submit_ray_job
 
+from tributo_broker_redis.active_jobs import ActiveOperationRecord
 from tributo_broker_redis.cancellation import (
     ActiveSubmission,
     ActiveSubmissionMap,
@@ -30,6 +35,7 @@ from tributo_broker_redis.config import (
 )
 from tributo_broker_redis.consumer import RedisTaskConsumer
 from tributo_broker_redis.operations import MappingFailure, prepare_operation
+from tributo_broker_redis.operations_v2 import parse_and_prepare_v2_training
 from tributo_broker_redis.protocol import (
     DriverInput,
     ProtocolFailure,
@@ -37,10 +43,60 @@ from tributo_broker_redis.protocol import (
 )
 from tributo_broker_redis.redis_client import create_redis_client
 from tributo_broker_redis.reporter import RedisEventReporter
+from tributo_broker_redis.supervisor import ActiveOperationSupervisor
+from tributo_broker_redis.terminal_guard import TerminalGuard
 
 logger = logging.getLogger(__name__)
 _DRIVER_ENV = "TRIBUTO_REDIS_DRIVER_INPUT_B64"
 _MAX_DRIVER_INPUT_BYTES = 64 * 1024
+
+
+class _MultiplexedConsumer(TaskConsumer):
+    """Fair TaskConsumer facade over independent operation channels."""
+
+    def __init__(self, consumers: Mapping[OperationType, RedisTaskConsumer]) -> None:
+        self._consumers = consumers
+        self._operations: tuple[OperationType, ...] = (
+            "training",
+            "batch_inference",
+        )
+        self._next = 0
+
+    def _consumer_for(self, message: Message) -> RedisTaskConsumer:
+        operation_type = cast(OperationType, message.metadata["operation_type"])
+        return self._consumers[operation_type]
+
+    def poll(self, timeout_ms: int = 5000) -> Message | None:
+        per_channel = max(0, timeout_ms // len(self._operations))
+        for offset in range(len(self._operations)):
+            index = (self._next + offset) % len(self._operations)
+            message = self._consumers[self._operations[index]].poll(per_channel)
+            if message is not None:
+                self._next = (index + 1) % len(self._operations)
+                return message
+        self._next = (self._next + 1) % len(self._operations)
+        return None
+
+    def ack(self, message: Message) -> None:
+        self._consumer_for(message).ack(message)
+
+    def retry(self, message: Message, error: BrokerError | None = None) -> None:
+        self._consumer_for(message).retry(message, error)
+
+    def reject(self, message: Message, error: BrokerError | None = None) -> None:
+        self._consumer_for(message).reject(message, error)
+
+    def recover_pending(self) -> int:
+        total = 0
+        for offset in range(len(self._operations)):
+            index = (self._next + offset) % len(self._operations)
+            total += self._consumers[self._operations[index]].recover_pending()
+        self._next = (self._next + 1) % len(self._operations)
+        return total
+
+    def close(self) -> None:
+        for consumer in self._consumers.values():
+            consumer.close()
 
 
 def validate_execution_environment(
@@ -84,6 +140,7 @@ class RedisBrokerRuntime(BrokerRuntime):
             )
             for operation_type in ("training", "batch_inference")
         }
+        self._consumer = _MultiplexedConsumer(self._consumers)
         self.active_submissions = ActiveSubmissionMap()
         self._cancel_watcher = CancelWatcher(
             self._redis,
@@ -93,22 +150,32 @@ class RedisBrokerRuntime(BrokerRuntime):
             max_event_bytes=config.transport.max_event_bytes,
             max_stream_length=config.transport.max_stream_length,
         )
-        self._next_channel = 0
+        self._supervisor = (
+            ActiveOperationSupervisor(self._redis, config)
+            if config.durability.enabled
+            else None
+        )
         self._closed = False
         if start_cancel_watcher:
-            self._cancel_watcher.start()
+            self.start()
 
     @property
-    def consumer(self) -> RedisTaskConsumer:
-        """Return one consumer only for the minimal Core contract surface."""
-        return self._consumers["training"]
+    def consumer(self) -> TaskConsumer:
+        """Return a fair dual-channel consumer for the Core runner."""
+        return self._consumer
 
     @property
     def consumers(self) -> Mapping[OperationType, RedisTaskConsumer]:
         return self._consumers
 
     def start(self) -> None:
-        self._cancel_watcher.start()
+        if self._supervisor is None:
+            self._cancel_watcher.start()
+
+    def maintain(self) -> None:
+        """Run one bounded durable reconciliation tick from the Core runner."""
+        if self._supervisor is not None:
+            self._supervisor.check_due()
 
     def _reporter(
         self,
@@ -119,6 +186,7 @@ class RedisBrokerRuntime(BrokerRuntime):
         run_id: str,
         attempt_id: str,
         submission: RayJobSubmission | None = None,
+        wire_protocol_profile: str = "tributo-generic-v1",
     ) -> RedisEventReporter:
         channel = self.config.channels.for_operation(operation_type)
         return RedisEventReporter(
@@ -134,6 +202,14 @@ class RedisBrokerRuntime(BrokerRuntime):
             outer_identity_field=channel.outer_identity_field,
             max_event_bytes=self.config.transport.max_event_bytes,
             max_stream_length=self.config.transport.max_stream_length,
+            durability_enabled=self.config.durability.enabled,
+            terminal_candidate_key_prefix=(
+                self.config.durability.terminal_candidate_key_prefix
+            ),
+            terminal_candidate_ttl_seconds=(
+                self.config.durability.terminal_candidate_ttl_seconds
+            ),
+            wire_protocol_profile=wire_protocol_profile,
         )
 
     def _invalid(
@@ -146,6 +222,7 @@ class RedisBrokerRuntime(BrokerRuntime):
         execution_profile: ExecutionProfile = "single_worker",
         run_id: str | None = None,
         attempt_id: str = "attempt-1",
+        wire_protocol_profile: str = "tributo-generic-v1",
     ) -> TaskOutcome:
         operation_id = message.metadata.get("outer_operation_id") or (
             f"invalid-{message.delivery_token}"
@@ -157,6 +234,7 @@ class RedisBrokerRuntime(BrokerRuntime):
                 execution_profile=execution_profile,
                 run_id=run_id or operation_id,
                 attempt_id=attempt_id,
+                wire_protocol_profile=wire_protocol_profile,
             ).publish(
                 "FAILED",
                 {
@@ -180,6 +258,9 @@ class RedisBrokerRuntime(BrokerRuntime):
 
     def handle(self, message: Message) -> TaskOutcome:
         operation_type = cast(OperationType, message.metadata["operation_type"])
+        timeout_seconds = self.config.durability.default_timeout_seconds
+        request_digest: str | None
+        protocol_profile: Literal["tributo-generic-v1", "knova-training-v2"]
         outer_operation_id = message.metadata.get("outer_operation_id", "")
         if not outer_operation_id:
             return self._invalid(
@@ -213,54 +294,114 @@ class RedisBrokerRuntime(BrokerRuntime):
                 sanitized_message="payload must be a JSON string",
             )
         try:
-            request = parse_request(
-                raw,
-                outer_operation_id=outer_operation_id,
-                expected_operation_type=operation_type,
-            )
-        except ProtocolFailure as exc:
-            return self._invalid(
-                message,
-                operation_type=operation_type,
-                code=exc.code,
-                sanitized_message=exc.sanitized_message,
-            )
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            decoded = None
+        is_v2 = isinstance(decoded, dict) and "protocol_profile" not in decoded
         try:
+            if is_v2:
+                if not self.config.accept_knova_v2 or operation_type != "training":
+                    raise MappingFailure(
+                        "UNSUPPORTED_PROTOCOL_PROFILE",
+                        "KnoVa protocol v2 is disabled for this channel",
+                    )
+                v2 = parse_and_prepare_v2_training(
+                    raw,
+                    outer_operation_id=outer_operation_id,
+                    allow_legacy_training_config=(
+                        self.config.allow_legacy_training_config
+                    ),
+                )
+                operation_id = v2.operation_id
+                execution_profile = v2.execution_profile
+                run_id = v2.run_id
+                attempt_id = v2.attempt_id
+                request_digest = v2.request_digest
+                if v2.timeout_seconds is not None:
+                    timeout_seconds = v2.timeout_seconds
+                protocol_profile = "knova-training-v2"
+                prepared = v2.prepared
+            else:
+                request = parse_request(
+                    raw,
+                    outer_operation_id=outer_operation_id,
+                    expected_operation_type=operation_type,
+                )
+                operation_id = request.operation_id
+                execution_profile = request.execution_profile
+                run_id = request.run_id or request.operation_id
+                attempt_id = request.attempt_id
+                request_digest = request.request_digest
+                protocol_profile = request.protocol_profile
+                prepared = prepare_operation(request)
             operation_config = self.config.operations.for_operation(operation_type)
-            if request.execution_profile not in operation_config.execution_profiles:
+            if execution_profile not in operation_config.execution_profiles:
                 raise MappingFailure(
                     "UNSUPPORTED_EXECUTION_PROFILE",
                     "execution profile is disabled by provider configuration",
                 )
-            prepared = prepare_operation(request)
-        except MappingFailure as exc:
+        except (ProtocolFailure, MappingFailure) as exc:
             return self._invalid(
                 message,
                 operation_type=operation_type,
                 code=exc.code,
                 sanitized_message=exc.sanitized_message,
-                execution_profile=request.execution_profile,
-                run_id=request.run_id or request.operation_id,
-                attempt_id=request.attempt_id,
+                execution_profile=(
+                    execution_profile
+                    if "execution_profile" in locals()
+                    else "single_worker"
+                ),
+                run_id=run_id if "run_id" in locals() else outer_operation_id,
+                attempt_id=attempt_id if "attempt_id" in locals() else "attempt-1",
+                wire_protocol_profile=(
+                    "knova-training-v2" if is_v2 else "tributo-generic-v1"
+                ),
             )
 
         channel = self.config.channels.for_operation(operation_type)
-        run_id = request.run_id or request.operation_id
         reporter = self._reporter(
-            operation_id=request.operation_id,
+            operation_id=operation_id,
             operation_type=operation_type,
-            execution_profile=request.execution_profile,
+            execution_profile=execution_profile,
             run_id=run_id,
-            attempt_id=request.attempt_id,
+            attempt_id=attempt_id,
+            wire_protocol_profile=protocol_profile,
         )
+        if request_digest is None:
+            request_digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        if self._supervisor is not None:
+            stream = channel.event_stream_key(operation_id)
+            terminal = TerminalGuard(
+                self._redis,
+                outer_identity_field=channel.outer_identity_field,
+                max_stream_length=self.config.transport.max_stream_length,
+            ).terminal_event(stream, operation_id)
+            if terminal is not None:
+                return TaskOutcome(TaskDisposition.ACK)
+            existing = self._supervisor.active_store.get(operation_type, operation_id)
+            if existing is not None:
+                if existing.request_digest == request_digest:
+                    return TaskOutcome(TaskDisposition.ACK)
+                return TaskOutcome(
+                    TaskDisposition.ACK,
+                    BrokerError(
+                        code="REQUEST_DIGEST_CONFLICT",
+                        sanitized_message=(
+                            "operation identity is already active with a different "
+                            "payload"
+                        ),
+                    ),
+                )
         try:
-            if bool(self._redis.exists(channel.cancel_key(request.operation_id))):
+            if bool(self._redis.exists(channel.cancel_key(operation_id))):
                 reporter.publish(
                     "CANCELLED",
                     {"reason": "cancelled before admission"},
                     phase="QUEUED",
                 )
                 return TaskOutcome(TaskDisposition.ACK)
+            if protocol_profile == "knova-training-v2":
+                reporter.publish("PHASE", {"phase": "QUEUED"}, phase="QUEUED")
         except Exception:
             return TaskOutcome(
                 TaskDisposition.RETRY,
@@ -272,11 +413,11 @@ class RedisBrokerRuntime(BrokerRuntime):
 
         namespace = f"redis-{operation_type.replace('_', '-')}"
         driver_input = DriverInput(
-            operation_id=request.operation_id,
+            operation_id=operation_id,
             operation_type=operation_type,
-            execution_profile=request.execution_profile,
+            execution_profile=execution_profile,
             run_id=run_id,
-            attempt_id=request.attempt_id,
+            attempt_id=attempt_id,
             credential_ref=prepared.credential_ref,
             operation_payload=prepared.operation_payload,
             redis_url=self.config.transport.ray_driver_url,
@@ -284,6 +425,14 @@ class RedisBrokerRuntime(BrokerRuntime):
             outer_identity_field=channel.outer_identity_field,
             max_event_bytes=self.config.transport.max_event_bytes,
             max_stream_length=self.config.transport.max_stream_length,
+            wire_protocol_profile=protocol_profile,
+            durability_enabled=self.config.durability.enabled,
+            terminal_candidate_key_prefix=(
+                self.config.durability.terminal_candidate_key_prefix
+            ),
+            terminal_candidate_ttl_seconds=(
+                self.config.durability.terminal_candidate_ttl_seconds
+            ),
         )
         encoded_driver_input = base64.urlsafe_b64encode(
             driver_input.model_dump_json().encode("utf-8")
@@ -298,61 +447,135 @@ class RedisBrokerRuntime(BrokerRuntime):
 
         env_vars = dict(self.config.execution.env_vars)
         env_vars[_DRIVER_ENV] = encoded_driver_input
+        execution_context: dict[str, Any] | None = None
+        if protocol_profile == "knova-training-v2":
+            shared_options = {
+                "redis_url": self.config.transport.ray_driver_url,
+                "event_stream_prefix": channel.event_stream_prefix,
+                "operation_type": operation_type,
+                "execution_profile": execution_profile,
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "outer_identity_field": channel.outer_identity_field,
+                "max_event_bytes": self.config.transport.max_event_bytes,
+                "max_stream_length": self.config.transport.max_stream_length,
+                "durability_enabled": self.config.durability.enabled,
+                "terminal_candidate_key_prefix": (
+                    self.config.durability.terminal_candidate_key_prefix
+                ),
+                "terminal_candidate_ttl_seconds": (
+                    self.config.durability.terminal_candidate_ttl_seconds
+                ),
+                "wire_protocol_profile": protocol_profile,
+            }
+            execution_context = {
+                "schema": "tributo.execution-context",
+                "version": 1,
+                "cancellation": {
+                    "factory_ref": (
+                        "tributo_broker_redis.worker_controls:"
+                        "create_cancellation_checker"
+                    ),
+                    "job_id": operation_id,
+                    "options": {
+                        "redis_url": self.config.transport.ray_driver_url,
+                        "cancel_key": channel.cancel_key(operation_id),
+                    },
+                },
+                "event_reporter": {
+                    "factory_ref": (
+                        "tributo_broker_redis.worker_controls:create_event_reporter"
+                    ),
+                    "job_id": operation_id,
+                    "options": shared_options,
+                },
+            }
         try:
-            submission = self._submitter(
-                "python -m tributo_broker_redis.execution_driver",
-                operation_namespace=namespace,
-                run_id=run_id,
-                attempt_id=request.attempt_id,
-                dashboard_url=self.config.execution.ray_dashboard_url,
-                env_vars=env_vars,
-                project_root=Path(self.config.execution.project_root)
+            submission_kwargs: dict[str, Any] = {
+                "operation_namespace": namespace,
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "dashboard_url": self.config.execution.ray_dashboard_url,
+                "env_vars": env_vars,
+                "project_root": Path(self.config.execution.project_root)
                 .expanduser()
                 .resolve(),
-                extra_py_modules=[
+                "extra_py_modules": [
                     module
                     if "://" in module
                     else str(Path(module).expanduser().resolve())
                     for module in self.config.execution.extra_py_modules
                 ],
-                runtime_pip_packages=list(self.config.execution.runtime_pip_packages),
-                metadata={
-                    "tributo.operation_id": request.operation_id,
+                "runtime_pip_packages": list(
+                    self.config.execution.runtime_pip_packages
+                ),
+                "metadata": {
+                    "tributo.operation_id": operation_id,
                     "tributo.operation_type": operation_type,
-                    "tributo.execution_profile": request.execution_profile,
-                    "tributo.protocol_profile": request.protocol_profile,
+                    "tributo.execution_profile": execution_profile,
+                    "tributo.protocol_profile": protocol_profile,
                 },
-                request_digest=request.request_digest,
-                entrypoint_num_cpus=self.config.execution.entrypoint_num_cpus,
+                "request_digest": request_digest,
+                "entrypoint_num_cpus": self.config.execution.entrypoint_num_cpus,
+            }
+            if execution_context is not None:
+                submission_kwargs["execution_context"] = execution_context
+            submission = self._submitter(
+                "python -m tributo_broker_redis.execution_driver",
+                **submission_kwargs,
             )
             active = ActiveSubmission(
-                operation_id=request.operation_id,
+                operation_id=operation_id,
                 operation_type=operation_type,
-                execution_profile=request.execution_profile,
+                execution_profile=execution_profile,
                 run_id=run_id,
                 channel=channel,
                 submission=submission,
             )
-            self.active_submissions.put(active)
+            if self._supervisor is not None:
+                submitted_at = time.time()
+                self._supervisor.active_store.save(
+                    ActiveOperationRecord(
+                        operation_id=operation_id,
+                        operation_type=operation_type,
+                        execution_profile=execution_profile,
+                        run_id=run_id,
+                        attempt_id=attempt_id,
+                        submission_id=submission.submission_id,
+                        ray_job_id=submission.ray_job_id,
+                        submitted_at=submitted_at,
+                        deadline_at=(
+                            submitted_at + timeout_seconds
+                            if timeout_seconds is not None
+                            else None
+                        ),
+                        request_digest=request_digest,
+                        wire_protocol_profile=protocol_profile,
+                    )
+                )
+            else:
+                self.active_submissions.put(active)
             self._reporter(
-                operation_id=request.operation_id,
+                operation_id=operation_id,
                 operation_type=operation_type,
-                execution_profile=request.execution_profile,
+                execution_profile=execution_profile,
                 run_id=run_id,
-                attempt_id=request.attempt_id,
+                attempt_id=attempt_id,
                 submission=submission,
+                wire_protocol_profile=protocol_profile,
             ).publish(
                 "ACCEPTED",
                 {
                     "submission_id": submission.submission_id,
                     "ray_job_id": submission.ray_job_id,
+                    "request_digest": request_digest,
                 },
                 phase="ADMITTED",
             )
         except Exception:
             logger.warning(
                 "Ray admission is not confirmed: operation_id=%s",
-                request.operation_id,
+                operation_id,
                 exc_info=True,
             )
             return TaskOutcome(
@@ -365,7 +588,7 @@ class RedisBrokerRuntime(BrokerRuntime):
         return TaskOutcome(TaskDisposition.ACK)
 
     def _apply_outcome(
-        self, consumer: RedisTaskConsumer, message: Message, outcome: TaskOutcome
+        self, consumer: TaskConsumer, message: Message, outcome: TaskOutcome
     ) -> None:
         if outcome.disposition == TaskDisposition.ACK:
             consumer.ack(message)
@@ -375,24 +598,17 @@ class RedisBrokerRuntime(BrokerRuntime):
             consumer.reject(message, outcome.error)
 
     def run_once(self, timeout_ms: int | None = None) -> bool:
-        operations: tuple[OperationType, ...] = ("training", "batch_inference")
-        per_channel_timeout = (
-            self.config.transport.block_ms
-            if timeout_ms is None
-            else max(0, timeout_ms // len(operations))
+        self.maintain()
+        self._consumer.recover_pending()
+        poll_timeout = (
+            self.config.transport.block_ms if timeout_ms is None else timeout_ms
         )
-        for offset in range(len(operations)):
-            index = (self._next_channel + offset) % len(operations)
-            operation_type = operations[index]
-            consumer = self._consumers[operation_type]
-            message = consumer.poll(per_channel_timeout)
-            if message is None:
-                continue
-            outcome = self.handle(message)
-            self._apply_outcome(consumer, message, outcome)
-            self._next_channel = (index + 1) % len(operations)
-            return True
-        return False
+        message = self._consumer.poll(poll_timeout)
+        if message is None:
+            return False
+        outcome = self.handle(message)
+        self._apply_outcome(self._consumer, message, outcome)
+        return True
 
     def run_forever(self) -> None:
         self.start()
@@ -403,7 +619,10 @@ class RedisBrokerRuntime(BrokerRuntime):
         if self._closed:
             return
         self._closed = True
-        self._cancel_watcher.close()
+        if self._supervisor is not None:
+            self._supervisor.close()
+        else:
+            self._cancel_watcher.close()
         close = getattr(self._redis, "close", None)
         if callable(close):
             close()

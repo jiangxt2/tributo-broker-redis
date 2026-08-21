@@ -61,6 +61,9 @@ class DriverInput(_StrictModel):
 
     protocol_profile: Literal["tributo-generic-v1"] = "tributo-generic-v1"
     protocol_version: Literal["1.0"] = "1.0"
+    wire_protocol_profile: Literal["tributo-generic-v1", "knova-training-v2"] = (
+        "tributo-generic-v1"
+    )
     operation_id: str
     operation_type: OperationType
     execution_profile: ExecutionProfile
@@ -77,6 +80,9 @@ class DriverInput(_StrictModel):
     )
     max_event_bytes: int
     max_stream_length: int
+    durability_enabled: bool = False
+    terminal_candidate_key_prefix: str = "tributo:terminal-candidate"
+    terminal_candidate_ttl_seconds: int = Field(default=7 * 24 * 60 * 60, ge=60)
 
 
 class ProtocolFailure(Exception):

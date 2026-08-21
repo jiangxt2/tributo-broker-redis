@@ -10,12 +10,16 @@ The release gate covers these healthy paths:
 - XGBoost training with `single_worker` and `distributed` profiles;
 - Bundle-backed batch inference with `single_worker` and `distributed` profiles;
 - Standalone Redis, Redis consumer groups, one provider execution-driver Ray
-  Job, Bundle or ResultSink output, and best-effort terminal events;
-- queued cancellation and running cancellation through Ray Jobs stop.
+  Job, Bundle or ResultSink output, and optional durable terminal publication;
+- the generic v1 training/inference contract plus strict KnoVa training v2;
+- queued cancellation, worker-round cancellation, running cancellation and
+  deadline handling through confirmed Ray Jobs stop.
 
 Unknown protocol fields and unsupported algorithms or profiles fail closed.
-This release does not promise cross-restart exactly-once behavior, durable
-events, complete pending recovery, DLQ processing, Sentinel, Cluster, or HA.
+With `durability.enabled=true`, Redis-backed active records, terminal
+candidates, single-key Lua terminal uniqueness and bounded supervisor recovery
+survive Provider restarts. This is not general exactly-once task execution and
+does not add DLQ processing, Sentinel, Cluster, or HA.
 
 ## Installation
 
@@ -81,8 +85,9 @@ Run the provider-owned consume loop:
 tributo-broker-redis consume --config /path/to/redis-provider.json
 ```
 
-Core provides discovery and validation through `tributo broker list` and
-`tributo broker validate`; Core does not own the production consume loop.
+Core provides discovery, validation, and a generic Broker runner. Its bounded
+`maintain()` tick drives Provider reconciliation before both active and idle
+polls. The Provider CLI retains its equivalent self-owned consume loop.
 
 ## Wire protocol
 
@@ -124,6 +129,14 @@ contains `submission_id`; `ray_job_id` remains optional execution metadata.
 Nonterminal events are best-effort and cannot change a successful workload into
 an execution failure. Ray state and Bundle or ResultSink receipts remain the
 result facts. An optional `request_digest` must be a lower-case SHA-256 digest.
+
+Canonical KnoVa v2 training emits `QUEUED` at Provider admission and the five
+remaining phases at actual Core boundaries: `LOADING_DATA`,
+`FEATURE_ENGINEERING`, `DATA_SPLITTING`, `TRAINING`, and `EVALUATING`. Rank zero
+publishes sampled live round metrics; every XGBoost worker checks cancellation
+after each round. Generic training and batch inference keep their existing v1
+event contract. See [`docs/protocol-v2-capabilities.md`](docs/protocol-v2-capabilities.md)
+for the strict fail-closed capability and completion-evidence matrix.
 
 See [`docs/operations.md`](docs/operations.md) and
 [`docs/generic-redis-stream-protocol-integration-test.md`](docs/generic-redis-stream-protocol-integration-test.md).

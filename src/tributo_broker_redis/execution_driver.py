@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from tributo_broker_redis.protocol import DriverInput
@@ -24,6 +25,32 @@ class CredentialUnavailable(Exception):
 
 class _TerminalEventPublicationError(Exception):
     """A completed execution whose terminal notification could not be emitted."""
+
+
+def _find_training_cancellation(error: BaseException) -> BaseException | None:
+    """Find a worker cancellation wrapped by Ray without trusting text alone."""
+    from tributo.training.execution_context import TrainingCancelledError
+
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < 64:
+        candidate = pending.pop()
+        if id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if isinstance(candidate, TrainingCancelledError):
+            return candidate
+        if not isinstance(candidate, BaseException):
+            continue
+        for nested in (
+            candidate.__cause__,
+            candidate.__context__,
+            getattr(candidate, "cause", None),
+        ):
+            if nested is not None:
+                pending.append(nested)
+        pending.extend(candidate.args)
+    return None
 
 
 def _load_driver_input() -> tuple[DriverInput, str]:
@@ -85,6 +112,10 @@ def _reporter(
         outer_identity_field=value.outer_identity_field,
         max_event_bytes=value.max_event_bytes,
         max_stream_length=value.max_stream_length,
+        durability_enabled=value.durability_enabled,
+        terminal_candidate_key_prefix=value.terminal_candidate_key_prefix,
+        terminal_candidate_ttl_seconds=value.terminal_candidate_ttl_seconds,
+        wire_protocol_profile=value.wire_protocol_profile,
     )
 
 
@@ -129,14 +160,25 @@ def _publish_nonterminal(
 def _run_training(value: DriverInput, reporter: RedisEventReporter) -> int:
     from tributo.training.xgboost_trainer import run_training_result_with_config
 
-    _publish_nonterminal(reporter, "PHASE", {"phase": "PREPARING"}, phase="PREPARING")
+    started_at = time.monotonic()
+    if value.wire_protocol_profile == "tributo-generic-v1":
+        _publish_nonterminal(
+            reporter, "PHASE", {"phase": "PREPARING"}, phase="PREPARING"
+        )
     _publish_nonterminal(
         reporter,
         "LOG",
         {"level": "INFO", "message": "Training driver started"},
-        phase="PREPARING",
+        phase=(
+            "PREPARING"
+            if value.wire_protocol_profile == "tributo-generic-v1"
+            else "LOADING_DATA"
+        ),
     )
-    _publish_nonterminal(reporter, "PHASE", {"phase": "EXECUTING"}, phase="EXECUTING")
+    if value.wire_protocol_profile == "tributo-generic-v1":
+        _publish_nonterminal(
+            reporter, "PHASE", {"phase": "EXECUTING"}, phase="EXECUTING"
+        )
     result = run_training_result_with_config(
         dict(value.operation_payload["training_config"])
     )
@@ -144,29 +186,58 @@ def _run_training(value: DriverInput, reporter: RedisEventReporter) -> int:
         serialized_result = result.model_dump(mode="json")
     except Exception as exc:
         raise _TerminalEventPublicationError from exc
-    _publish_nonterminal(
-        reporter,
-        "METRICS",
-        {"progress": 1.0, "metrics": serialized_result.get("metrics", {})},
-        phase="EXECUTING",
-    )
-    _publish_nonterminal(
-        reporter,
-        "PHASE",
-        {"phase": "MATERIALIZING"},
-        phase="MATERIALIZING",
-    )
-    _publish_completed(
-        reporter,
-        {
+    reported_metrics: dict[str, object]
+    if value.wire_protocol_profile == "knova-training-v2":
+        reported_metrics = {
+            "progress_percent": 100,
+            "metrics": [
+                {"metric_name": str(name), "eval": metric}
+                for name, metric in serialized_result.get("metrics", {}).items()
+                if isinstance(metric, (int, float)) and not isinstance(metric, bool)
+            ],
+        }
+    else:
+        reported_metrics = {
+            "progress": 1.0,
+            "metrics": serialized_result.get("metrics", {}),
+        }
+    if value.wire_protocol_profile == "tributo-generic-v1":
+        _publish_nonterminal(
+            reporter,
+            "METRICS",
+            reported_metrics,
+            phase="EXECUTING",
+        )
+        _publish_nonterminal(
+            reporter,
+            "PHASE",
+            {"phase": "MATERIALIZING"},
+            phase="MATERIALIZING",
+        )
+    completion_context = value.operation_payload.get("v2_completion_context")
+    if value.wire_protocol_profile == "knova-training-v2":
+        if not isinstance(completion_context, dict):
+            raise ValueError(
+                "canonical v2 completion context is required; legacy training_config "
+                "cannot produce the strict v2 terminal"
+            )
+        from tributo_broker_redis.completion_v2 import build_v2_completed_payload
+
+        completed = build_v2_completed_payload(
+            completion_context,
+            serialized_result,
+            duration_seconds=time.monotonic() - started_at,
+        )
+    else:
+        completed = {
             "result": serialized_result,
             "result_reference": {
                 "kind": "bundle",
                 "uri": result.bundle_uri,
                 "execution_id": result.execution_id,
             },
-        },
-    )
+        }
+    _publish_completed(reporter, completed)
     return 0
 
 
@@ -250,6 +321,13 @@ def main() -> int:
         )
         return 1
     except Exception as exc:
+        if _find_training_cancellation(exc) is not None:
+            reporter.publish(
+                "CANCELLED",
+                {"reason": "worker observed cancellation", "has_best_model": False},
+                phase="TRAINING",
+            )
+            return 0
         reporter.failed("EXECUTION_FAILED", type(exc).__name__, "EXECUTING")
         return 1
     finally:

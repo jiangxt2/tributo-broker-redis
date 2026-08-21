@@ -5,9 +5,9 @@ on:
   pull_request:
 
 env:
-  # Pin the exact Core baseline used by the provider wheel and Redis/Ray matrix.
-  TRIBUTO_CORE_REPOSITORY: jiangxt2/Tributo
-  TRIBUTO_CORE_REF: 8a3bb4dfecd7fd6574d764b45d5f28c1ca73ed66
+  # Exact Core revision exercised by this provider branch's wheel/E2E matrix.
+  TRIBUTO_CORE_REPOSITORY: Chang-Tong/Tributo
+  TRIBUTO_CORE_REF: 754c6f8a751af3fa27e93ea3b83f53990e1ff3ee
 
 jobs:
   unit:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import fnmatch
+import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,7 @@ class FakeRedis:
         self.messages: dict[str, list[tuple[str, dict[str, str]]]] = {}
         self.events: dict[str, list[dict[str, str]]] = {}
         self.cancelled: set[str] = set()
+        self.values: dict[str, str] = {}
         self.acked: list[tuple[str, str, str]] = []
         self.closed = False
 
@@ -34,12 +38,65 @@ class FakeRedis:
         self.events.setdefault(stream, []).append(fields)
         return "1-0"
 
-    def xrevrange(self, stream: str, *, count: int) -> list[Any]:
+    def xrevrange(
+        self, stream: str, *, count: int, max: str = "+", min: str = "-"
+    ) -> list[Any]:
+        del max, min
         values = self.events.get(stream, [])[-count:]
         return [(f"{index}-0", fields) for index, fields in enumerate(reversed(values))]
 
     def exists(self, key: str) -> int:
         return int(key in self.cancelled)
+
+    def eval(self, script: str, _keys: int, key: str, *args: str) -> Any:
+        if "SAVE_ACTIVE_OPERATION" in script:
+            if key in self.values:
+                existing = json.loads(self.values[key])
+                incoming = json.loads(args[0])
+                if existing["submission_id"] != incoming[
+                    "submission_id"
+                ] or existing.get("request_digest") != incoming.get("request_digest"):
+                    raise RuntimeError("active operation identity conflict")
+            self.values[key] = args[0]
+            return 1
+        if "STAGE_TERMINAL_CANDIDATE" in script:
+            self.values.setdefault(key, args[0])
+            return self.values[key]
+        if "PUBLISH_GUARDED_EVENT" in script:
+            identity_field, operation_id, encoded, event_type, phase, _maxlen = args
+            for fields in self.events.get(key, []):
+                event = json.loads(fields["payload"])
+                if event.get("event_type") in {"COMPLETED", "FAILED", "CANCELLED"}:
+                    return [
+                        "terminal_exists"
+                        if event_type in {"COMPLETED", "FAILED", "CANCELLED"}
+                        else "rejected_after_terminal",
+                        "",
+                    ]
+                if event_type == "PHASE" and event.get("phase") == phase:
+                    return ["duplicate_phase", ""]
+            self.events.setdefault(key, []).append(
+                {identity_field: operation_id, "payload": encoded}
+            )
+            return ["published", "1-0"]
+        raise AssertionError("unexpected Lua script")
+
+    def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    def set(self, key: str, value: str) -> bool:
+        self.values[key] = value
+        return True
+
+    def delete(self, key: str) -> int:
+        return int(self.values.pop(key, None) is not None)
+
+    def expire(self, key: str, _ttl: int) -> int:
+        return int(key in self.values)
+
+    def scan_iter(self, *, match: str, count: int) -> Iterator[str]:
+        del count
+        return iter(key for key in tuple(self.values) if fnmatch.fnmatch(key, match))
 
     def close(self) -> None:
         self.closed = True

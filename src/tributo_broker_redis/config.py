@@ -14,6 +14,8 @@ from urllib.parse import urlsplit
 from packaging.requirements import InvalidRequirement, Requirement
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from tributo_broker_redis.protocol_v2 import MIN_TERMINAL_EVENT_BYTES
+
 OperationType = Literal["training", "batch_inference"]
 ExecutionProfile = Literal["single_worker", "distributed"]
 
@@ -32,7 +34,7 @@ class RedisTransportConfig(_StrictModel):
     claim_idle_ms: int = Field(default=60000, ge=0)
     claim_count: int = Field(default=10, ge=1, le=1000)
     max_payload_bytes: int = Field(default=1024 * 1024, ge=1)
-    max_event_bytes: int = Field(default=1024 * 1024, ge=1)
+    max_event_bytes: int = Field(default=1024 * 1024, ge=MIN_TERMINAL_EVENT_BYTES)
     max_stream_length: int = Field(default=1000, ge=1)
 
     @field_validator("url", "driver_url")
@@ -253,6 +255,47 @@ class ExecutionConfig(_StrictModel):
         return self
 
 
+class DurabilityConfig(_StrictModel):
+    """Restart-safe operation reconciliation and terminal publication."""
+
+    enabled: bool = False
+    active_key_prefix: str = Field(default="tributo:active", min_length=1)
+    terminal_candidate_key_prefix: str = Field(
+        default="tributo:terminal-candidate", min_length=1
+    )
+    active_ttl_seconds: int = Field(default=7 * 24 * 60 * 60, ge=60)
+    terminal_candidate_ttl_seconds: int = Field(default=7 * 24 * 60 * 60, ge=60)
+    supervisor_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    supervisor_scan_count: int = Field(default=100, ge=1, le=1000)
+    default_timeout_seconds: int | None = Field(default=None, ge=1)
+
+    @field_validator("active_key_prefix", "terminal_candidate_key_prefix")
+    @classmethod
+    def _safe_key_prefix(cls, value: str) -> str:
+        if any(character in value for character in "{}\x00\r\n"):
+            raise ValueError(
+                "durability key prefixes must not contain braces or controls"
+            )
+        return value.rstrip(":")
+
+    @staticmethod
+    def _identity(operation_type: OperationType, operation_id: str) -> str:
+        return f"{{{operation_type}:{operation_id}}}"
+
+    def active_key(self, operation_type: OperationType, operation_id: str) -> str:
+        return (
+            f"{self.active_key_prefix}:{self._identity(operation_type, operation_id)}"
+        )
+
+    def terminal_candidate_key(
+        self, operation_type: OperationType, operation_id: str
+    ) -> str:
+        return (
+            f"{self.terminal_candidate_key_prefix}:"
+            f"{self._identity(operation_type, operation_id)}"
+        )
+
+
 class RedisBrokerConfig(_StrictModel):
     """Normalized provider root configuration; this is the only accepted shape."""
 
@@ -263,6 +306,15 @@ class RedisBrokerConfig(_StrictModel):
     protocol: ProtocolProfileConfig = Field(default_factory=ProtocolProfileConfig)
     operations: OperationSet = Field(default_factory=OperationSet)
     execution: ExecutionConfig
+    durability: DurabilityConfig = Field(default_factory=DurabilityConfig)
+    accept_knova_v2: bool = False
+    allow_legacy_training_config: bool = False
+
+    @model_validator(mode="after")
+    def _v2_requires_durability(self) -> RedisBrokerConfig:
+        if self.accept_knova_v2 and not self.durability.enabled:
+            raise ValueError("accept_knova_v2 requires durability.enabled=true")
+        return self
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> RedisBrokerConfig:

@@ -19,12 +19,25 @@ from tributo_broker_redis.cancellation import (
 from tributo_broker_redis.config import OperationType, RedisBrokerConfig
 from tributo_broker_redis.execution_driver import (
     CredentialUnavailable,
+    _find_training_cancellation,
     _load_driver_input,
     _resolve_credential_reference,
 )
 from tributo_broker_redis.protocol import DriverInput
 from tributo_broker_redis.reporter import RedisEventReporter, redact
 from tributo_broker_redis.runtime import RedisBrokerRuntime
+
+
+def test_worker_cancellation_is_found_through_nested_ray_wrappers() -> None:
+    from tributo.training.execution_context import TrainingCancelledError
+
+    cancellation = TrainingCancelledError("cancelled on worker")
+    inner = RuntimeError("ray task wrapper", cancellation)
+    outer = RuntimeError("ray job wrapper")
+    outer.__cause__ = inner
+    inner.__context__ = cancellation
+
+    assert _find_training_cancellation(outer) is cancellation
 
 
 def _request(
@@ -125,10 +138,12 @@ def test_runtime_consumes_each_channel_admits_one_driver_and_acks(
     assert driver_input["run_id"] == f"run-{operation_id}"
     assert kwargs["run_id"] == driver_input["run_id"]
     assert kwargs["operation_namespace"] == f"redis-{operation_type.replace('_', '-')}"
+    assert "execution_context" not in kwargs
     assert "submission_id" not in driver_input
     assert secret_value not in json.dumps(kwargs, default=str)
     active = runtime.active_submissions.get(operation_id)
     assert active is not None
+    assert runtime._supervisor is None
     event_stream = config.channels.for_operation(
         cast(OperationType, operation_type)
     ).event_stream_key(operation_id)
