@@ -7,7 +7,7 @@ on:
 env:
   # Exact Core revision exercised by this provider branch's wheel/E2E matrix.
   TRIBUTO_CORE_REPOSITORY: Chang-Tong/Tributo
-  TRIBUTO_CORE_REF: db15dd45b1c05efa8c5fcd7b58995d951e6abedc
+  TRIBUTO_CORE_REF: c7d18ba2dbf6750e93aba6a3ceef5a4b6f5485da
 
 jobs:
   unit:
