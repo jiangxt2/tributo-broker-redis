@@ -21,9 +21,10 @@ Job.
 ## Admission and ACK
 
 The consumer validates protocol, outer identity, supported operation/profile,
-and queued cancellation before admission. It then submits or reconciles a
-deterministic `submission_id`, records the in-memory active mapping, publishes
-`ACCEPTED`, and calls `XACK`.
+and queued cancellation before admission. With durability enabled it records
+the operation identity, request digest, deterministic `submission_id`, and
+deadline in Redis before acknowledging admission. It then publishes the
+profile-appropriate queued/accepted event and calls `XACK`.
 
 `ACK` means Ray accepted the execution, not that execution completed. An
 ambiguous Ray response is queried by the same `submission_id`; if admission
@@ -31,11 +32,12 @@ cannot be confirmed, the Redis delivery remains pending. An invalid or
 unsupported request publishes a sanitized `FAILED` event and is ACKed to avoid
 a poison loop.
 
-The event Stream is best effort. It is not an outbox or terminal ledger.
-Failures to publish `PHASE`, `LOG`, `METRICS`, or `PROGRESS` are logged and do
-not replace a successful workload result with `EXECUTION_FAILED`. The driver
-makes at most one immediate retry for a transient nonterminal publication
-failure; this is not a durable delivery guarantee.
+Nonterminal `PHASE`, `LOG`, `METRICS`, and `PROGRESS` events remain best effort.
+Terminal events are staged as Redis candidates before publication and guarded
+by a single-key Lua operation: one terminal wins globally and events after a
+terminal are rejected. The supervisor replays staged candidates and reconciles
+active Ray Jobs after process restart. This is a scoped terminal ledger, not a
+general transactional outbox for every event.
 
 New consumer groups start at `0-0`, so tasks already present in a newly
 configured Stream are eligible for delivery. `block_ms` must be a positive,
@@ -49,23 +51,19 @@ Each operation has an independent cancel key prefix.
 - Before admission, an existing cancel key produces `CANCELLED` and ACK; no
   Ray Job is created. A failed cancel-key check is fail-closed and leaves the
   delivery pending.
-- After admission, the provider watcher calls `stop_job(submission_id)`. It
-  publishes `CANCELLED` only after Ray reports `STOPPED`.
+- After admission, the durable supervisor calls `stop_job(submission_id)` and
+  retries when Ray has not accepted the stop. It publishes `CANCELLED` only
+  after Ray reports `STOPPED`.
 - If Ray already reports `SUCCEEDED` or `FAILED`, a later cancel key has no
   effect.
-- If Ray reports `STOPPED` without a provider stop request, the watcher removes
-  the process-local active entry without publishing `CANCELLED`. Consumers must
-  use the accepted `submission_id` to inspect Ray status; v0.1 does not invent a
-  provider cancellation reason for an external stop.
+- Worker execution also checks the same Redis cancel identity at training
+  boundaries and XGBoost rounds; wrapped Ray cancellation failures are mapped
+  back to `CANCELLED`.
 
-The active operation map is process-local. Restart recovery and cooperative
-worker cancellation are not v0.1 guarantees.
-
-The watcher checks for an existing terminal event before requesting a stop,
-but artifact persistence and event publication are not transactional in v0.1.
-If cancellation lands in that narrow interval, consumers must treat a durable
-Bundle or ResultSink receipt as the execution fact. Durable terminal
-arbitration belongs to the later reliability phase.
+Active operations and terminal candidates are Redis-backed. Restart recovery,
+deadline enforcement, terminal redelivery, and cooperative worker cancellation
+are part of the durable profile. The terminal guard resolves completion versus
+cancellation races without emitting two terminal events.
 
 ## Credentials
 
@@ -86,9 +84,12 @@ published, the driver classifies the notification failure as
 `TERMINAL_EVENT_PUBLICATION_FAILED`, not as an execution failure. Event
 delivery remains best effort.
 
-Redis URLs must be credential-free. Deployments that require authenticated
-Redis should add an independently reviewed client/secret integration in a
-later provider version; plaintext URL credentials are rejected in v0.1.
+Redis URLs must be credential-free. Standalone, Sentinel, and Cluster
+credentials may be referenced only by configured environment-variable names;
+Sentinel and Redis master credentials remain separate. TLS certificate and key
+settings must reference absolute mounted paths. Credential values are resolved
+only in the process constructing the client and are never serialized into the
+driver descriptor.
 
 ## Observability
 
@@ -105,10 +106,11 @@ reference.
 
 ## Alpha failure boundary
 
-An external supervisor may restart the consume process after a Redis outage.
-XAUTOCLAIM remains a best-effort hook, but the release does not promise cursor
-persistence, reconnect state restoration, DLQ behavior, HA, durable events,
-or cross-restart exactly-once execution.
+The durable profile persists active-scan cursors, reclaims pending deliveries,
+reconstructs Redis clients after standalone/Sentinel/Cluster failover, and
+reconciles terminal state across Provider restarts. It guarantees terminal
+uniqueness for one operation identity; it does not promise general exactly-once
+task side effects or DLQ processing.
 
 ## Validation
 

@@ -47,6 +47,9 @@ any Redis delivery can be consumed.
 The provider accepts one closed root shape. Training and batch inference must
 have separate task, event, cancel, and consumer-group names. See
 [`docs/config.example.json`](docs/config.example.json) for a complete example.
+The checked example enables strict KnoVa training v2 together with the required
+durability layer while retaining the generic training and batch-inference
+channels. Replace its deployment paths before use.
 
 Redis URLs cannot contain credentials. `execution.env_vars` is only for
 non-sensitive settings. A task may carry `credential_ref`; the Ray driver

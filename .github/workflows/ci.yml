@@ -36,6 +36,8 @@ jobs:
         run: mypy src tests/unit
       - name: Suppression check
         run: ./scripts/check_suppressions.sh
+      - name: Validate KnoVa v2 reference configuration
+        run: tributo-broker-redis validate --config docs/config.example.json
       - name: Unit tests
         run: python -m pytest -q tests/unit
       - name: Wheel entry-point discovery

@@ -1,6 +1,8 @@
 {
   "broker_id": "tributo-redis",
   "api_version": 1,
+  "accept_knova_v2": true,
+  "allow_legacy_training_config": false,
   "transport": {
     "mode": "standalone",
     "url": "redis://127.0.0.1:6379/0",
@@ -36,6 +38,16 @@
     "profile": "tributo-generic-v1",
     "protocol_version": "1.0"
   },
+  "durability": {
+    "enabled": true,
+    "active_key_prefix": "tributo:active",
+    "terminal_candidate_key_prefix": "tributo:terminal-candidate",
+    "active_ttl_seconds": 604800,
+    "terminal_candidate_ttl_seconds": 604800,
+    "supervisor_interval_seconds": 1.0,
+    "supervisor_scan_count": 100,
+    "default_timeout_seconds": 3600
+  },
   "operations": {
     "training": {
       "execution_profiles": ["single_worker", "distributed"]
@@ -46,7 +58,7 @@
   },
   "execution": {
     "ray_dashboard_url": "http://127.0.0.1:8265",
-    "project_root": "/opt/tributo-core",
+    "project_root": "./tributo-core",
     "extra_py_modules": [],
     "runtime_pip_packages": [
       "/provider/tributo_broker_redis-0.1.0-py3-none-any.whl"
